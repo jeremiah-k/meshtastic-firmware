@@ -24,13 +24,13 @@ while getopts ":hp:P:f:" opt; do
             exit 0
             ;;
         p)  export ESPTOOL_PORT=${OPTARG}
-	    ;;
+        ;;
         P)  PYTHON=${OPTARG}
             ;;
         f)  FILENAME=${OPTARG}
             ;;
         *)
- 	    echo "Invalid flag."
+        echo "Invalid flag."
             show_help >&2
             exit 1
             ;;
@@ -43,12 +43,22 @@ shift "$((OPTIND-1))"
     shift
 }
 
-if [ -f "${FILENAME}" ] && [ -z "${FILENAME##*"update"*}" ]; then
-	printf "Trying to flash update ${FILENAME}"
-	$PYTHON -m esptool --baud 115200 write_flash 0x10000 ${FILENAME}
+# Check if esptool is available
+if "$PYTHON" -m esptool version >/dev/null 2>&1; then
+    ESPTOOL_CMD="$PYTHON -m esptool"
+elif command -v esptool.py >/dev/null 2>&1; then
+    ESPTOOL_CMD="esptool.py"
 else
-	show_help
-	echo "Invalid file: ${FILENAME}"
+    echo "esptool not found. Please install esptool via pip or pipx."
+    exit 1
+fi
+
+if [ -f "${FILENAME}" ] && [ -z "${FILENAME##*"update"*}" ]; then
+    printf "Trying to flash update ${FILENAME}"
+    $ESPTOOL_CMD --baud 115200 write_flash 0x10000 ${FILENAME}
+else
+    show_help
+    echo "Invalid file: ${FILENAME}"
 fi
 
 exit 0

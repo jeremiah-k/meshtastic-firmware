@@ -2,6 +2,20 @@
 
 set PYTHON=python
 
+REM Check if esptool is available
+%PYTHON% -m esptool version >nul 2>&1
+IF %ERRORLEVEL% EQU 0 (
+    SET "ESPTOOL_CMD=%PYTHON% -m esptool"
+) ELSE (
+    WHERE esptool.py >nul 2>&1
+    IF %ERRORLEVEL% EQU 0 (
+        SET "ESPTOOL_CMD=esptool.py"
+    ) ELSE (
+        ECHO esptool not found. Please install esptool via pip or pipx.
+        GOTO EOF
+    )
+)
+
 goto GETOPTS
 :HELP
 echo Usage: %~nx0 [-h] [-p ESPTOOL_PORT] [-P PYTHON] [-f FILENAME^|FILENAME]
@@ -24,17 +38,17 @@ IF NOT "__%1__"=="____" goto GETOPTS
 
 IF "__%FILENAME%__" == "____" (
     echo "Missing FILENAME"
-	goto HELP
+    goto HELP
 )
 IF EXIST %FILENAME% IF NOT x%FILENAME:update=%==x%FILENAME% (
     echo Trying to flash update %FILENAME%
-    %PYTHON% -m esptool --baud 115200 write_flash 0x10000 %FILENAME%
+    %ESPTOOL_CMD% --baud 115200 write_flash 0x10000 %FILENAME%
 ) else (
     echo "Invalid file: %FILENAME%"
-	goto HELP
+    goto HELP
 ) else (
     echo "Invalid file: %FILENAME%"
-	goto HELP
+    goto HELP
 )
 
 :EOF
