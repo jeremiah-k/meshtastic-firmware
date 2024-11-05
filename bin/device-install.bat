@@ -3,38 +3,38 @@
 set PYTHON=python
 
 REM Check if esptool is available
-%PYTHON% -m esptool version >nul 2>&1
+WHERE esptool >nul 2>&1
 IF %ERRORLEVEL% EQU 0 (
-    SET "ESPTOOL_CMD=%PYTHON% -m esptool"
+    SET "ESPTOOL_CMD=esptool"
 ) ELSE (
-    WHERE esptool >nul 2>&1
-    IF %ERRORLEVEL% EQU 0 (
-        SET "ESPTOOL_CMD=esptool"
-    ) ELSE (
-        ECHO esptool not found. Please install esptool via pip or pipx.
-        GOTO EOF
-    )
+    ECHO esptool not found. Please install esptool via pip or pipx.
+    GOTO EOF
 )
 
 goto GETOPTS
+
 :HELP
 echo Usage: %~nx0 [-h] [-p ESPTOOL_PORT] [-P PYTHON] [-f FILENAME^|FILENAME]
-echo Flash image file to device, but first erasing and writing system information
+echo Flash image file to device, but first erasing and writing system information.
 echo.
 echo     -h               Display this help and exit
-echo     -p ESPTOOL_PORT  Set the environment variable for ESPTOOL_PORT.  If not set, ESPTOOL iterates all ports (Dangerrous).
-echo     -P PYTHON        Specify alternate python interpreter to use to invoke esptool. (Default: %PYTHON%)
-echo     -f FILENAME      The .bin file to flash.  Custom to your device type and region.
+echo     -p ESPTOOL_PORT  Set the environment variable for ESPTOOL_PORT. If not set, ESPTOOL iterates all ports (Dangerous).
+echo     -P PYTHON        Specify alternate python interpreter to invoke esptool. (Default: %PYTHON%)
+echo     -f FILENAME      The .bin file to flash. Custom to your device type and region.
 goto EOF
 
 :GETOPTS
 if /I "%1"=="-h" goto HELP
 if /I "%1"=="--help" goto HELP
-if /I "%1"=="-F" set "FILENAME=%2" & SHIFT
-if /I "%1"=="-p" set ESPTOOL_PORT=%2 & SHIFT
-if /I "%1"=="-P" set PYTHON=%2 & SHIFT
-SHIFT
-IF NOT "__%1__"=="____" goto GETOPTS
+if /I "%1"=="-F" set "FILENAME=%2" & SHIFT & SHIFT & goto GETOPTS
+if /I "%1"=="-f" set "FILENAME=%2" & SHIFT & SHIFT & goto GETOPTS
+if /I "%1"=="-p" set ESPTOOL_PORT=%2 & SHIFT & SHIFT & goto GETOPTS
+if /I "%1"=="-P" set "PYTHON=%2" & SHIFT & SHIFT & goto GETOPTS
+if NOT "%1"=="" (
+    set "FILENAME=%1"
+    SHIFT
+    goto GETOPTS
+)
 
 IF "__%FILENAME%__" == "____" (
     echo "Missing FILENAME"

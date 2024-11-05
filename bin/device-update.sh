@@ -1,6 +1,6 @@
 #!/bin/sh
 
-PYTHON=${PYTHON:-$(which python3 python|head -n 1)}
+PYTHON=${PYTHON:-$(which python3 python | head -n 1)}
 
 # Usage info
 show_help() {
@@ -9,13 +9,12 @@ Usage: $(basename $0) [-h] [-p ESPTOOL_PORT] [-P PYTHON] [-f FILENAME|FILENAME]
 Flash image file to device, leave existing system intact."
 
     -h               Display this help and exit
-    -p ESPTOOL_PORT  Set the environment variable for ESPTOOL_PORT.  If not set, ESPTOOL iterates all ports (Dangerrous).
-    -P PYTHON        Specify alternate python interpreter to use to invoke esptool. (Default: "$PYTHON")
-    -f FILENAME      The *update.bin file to flash.  Custom to your device type.
-    
+    -p ESPTOOL_PORT  Set the environment variable for ESPTOOL_PORT. If not set, ESPTOOL iterates all ports (Dangerous).
+    -P PYTHON        Specify alternate python interpreter to invoke esptool. (Default: "$PYTHON")
+    -f FILENAME      The *update.bin file to flash. Custom to your device type.
+
 EOF
 }
-
 
 while getopts ":hp:P:f:" opt; do
     case "${opt}" in
@@ -23,14 +22,17 @@ while getopts ":hp:P:f:" opt; do
             show_help
             exit 0
             ;;
-        p)  export ESPTOOL_PORT=${OPTARG}
-        ;;
-        P)  PYTHON=${OPTARG}
+        p)
+            export ESPTOOL_PORT=${OPTARG}
             ;;
-        f)  FILENAME=${OPTARG}
+        P)
+            PYTHON=${OPTARG}
+            ;;
+        f)
+            FILENAME=${OPTARG}
             ;;
         *)
-        echo "Invalid flag."
+            echo "Invalid flag."
             show_help >&2
             exit 1
             ;;
@@ -38,24 +40,24 @@ while getopts ":hp:P:f:" opt; do
 done
 shift "$((OPTIND-1))"
 
-[ -z "$FILENAME" -a -n "$1" ] && {
+if [ -z "$FILENAME" ] && [ -n "$1" ]; then
     FILENAME=$1
     shift
-}
+fi
 
 # Check if esptool is available
-if "$PYTHON" -m esptool version >/dev/null 2>&1; then
-    ESPTOOL_CMD="$PYTHON -m esptool"
-elif command -v esptool.py >/dev/null 2>&1; then
+if command -v esptool.py >/dev/null 2>&1; then
     ESPTOOL_CMD="esptool.py"
+elif "$PYTHON" -m esptool version >/dev/null 2>&1; then
+    ESPTOOL_CMD="$PYTHON -m esptool"
 else
     echo "esptool not found. Please install esptool via pip or pipx."
     exit 1
 fi
 
-if [ -f "${FILENAME}" ] && [ -z "${FILENAME##*"update"*}" ]; then
-    printf "Trying to flash update ${FILENAME}"
-    $ESPTOOL_CMD --baud 115200 write_flash 0x10000 ${FILENAME}
+if [ -f "${FILENAME}" ] && [[ "${FILENAME}" == *"update"* ]]; then
+    printf "Trying to flash update ${FILENAME}\n"
+    $ESPTOOL_CMD --baud 115200 write_flash 0x10000 "${FILENAME}"
 else
     show_help
     echo "Invalid file: ${FILENAME}"
