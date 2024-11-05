@@ -7,9 +7,9 @@ REM Check if esptool is available
 IF %ERRORLEVEL% EQU 0 (
     SET "ESPTOOL_CMD=%PYTHON% -m esptool"
 ) ELSE (
-    WHERE esptool.py >nul 2>&1
+    WHERE esptool >nul 2>&1
     IF %ERRORLEVEL% EQU 0 (
-        SET "ESPTOOL_CMD=esptool.py"
+        SET "ESPTOOL_CMD=esptool"
     ) ELSE (
         ECHO esptool not found. Please install esptool via pip or pipx.
         GOTO EOF
@@ -22,7 +22,7 @@ echo Usage: %~nx0 [-h] [-p ESPTOOL_PORT] [-P PYTHON] [-f FILENAME^|FILENAME]
 echo Flash image file to device, leave existing system intact.
 echo.
 echo     -h               Display this help and exit
-echo     -p ESPTOOL_PORT  Set the environment variable for ESPTOOL_PORT.  If not set, ESPTOOL iterates all ports (Dangerrous).
+echo     -p ESPTOOL_PORT  Set the environment variable for ESPTOOL_PORT.  If not set, ESPTOOL iterates all ports (Dangerous).
 echo     -P PYTHON        Specify alternate python interpreter to use to invoke esptool. (Default: %PYTHON%)
 echo     -f FILENAME      The *update.bin file to flash.  Custom to your device type.
 goto EOF

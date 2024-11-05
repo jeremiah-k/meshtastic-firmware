@@ -7,9 +7,9 @@ REM Check if esptool is available
 IF %ERRORLEVEL% EQU 0 (
     SET "ESPTOOL_CMD=%PYTHON% -m esptool"
 ) ELSE (
-    WHERE esptool.py >nul 2>&1
+    WHERE esptool >nul 2>&1
     IF %ERRORLEVEL% EQU 0 (
-        SET "ESPTOOL_CMD=esptool.py"
+        SET "ESPTOOL_CMD=esptool"
     ) ELSE (
         ECHO esptool not found. Please install esptool via pip or pipx.
         GOTO EOF
@@ -41,10 +41,10 @@ IF "__%FILENAME%__" == "____" (
     goto HELP
 )
 IF EXIST %FILENAME% IF x%FILENAME:update=%==x%FILENAME% (
-    echo Trying to flash update %FILENAME%, but first erasing and writing system information"
+    echo Trying to flash %FILENAME%, but first erasing and writing system information"
     %ESPTOOL_CMD% --baud 115200 erase_flash
     %ESPTOOL_CMD% --baud 115200 write_flash 0x00 %FILENAME%
-    
+
     @REM Account for S3 and C3 board's different OTA partition
     IF x%FILENAME:s3=%==x%FILENAME% IF x%FILENAME:v3=%==x%FILENAME% IF x%FILENAME:t-deck=%==x%FILENAME% IF x%FILENAME:wireless-paper=%==x%FILENAME% IF x%FILENAME:wireless-tracker=%==x%FILENAME% IF x%FILENAME:station-g2=%==x%FILENAME% IF x%FILENAME:unphone=%==x%FILENAME% (
         IF x%FILENAME:esp32c3=%==x%FILENAME% (
