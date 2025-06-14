@@ -13,11 +13,15 @@
 #include "PowerMon.h"
 #include "error.h"
 #include "main.h"
+#include "mesh/RadioInterface.h"
 #include "meshUtils.h"
 
 #ifdef BQ25703A_ADDR
 #include "BQ25713.h"
 #endif
+
+// External declaration for global radio interface
+extern RadioInterface *rIf;
 
 static inline void debugger_break(void)
 {
@@ -275,6 +279,15 @@ void cpuDeepSleep(uint32_t msecToWake)
 {
     // FIXME, configure RTC or button press to wake us
     // FIXME, power down SPI, I2C, RAMs
+
+    // Shutdown radio to prevent wake-up interrupts
+    if (rIf) {
+        LOG_DEBUG("Shutting down radio before deep sleep");
+        rIf->sleep();
+        // Give radio time to fully shutdown
+        delay(10);
+    }
+
 #if HAS_WIRE
     Wire.end();
 #endif
@@ -373,6 +386,14 @@ void cpuDeepSleep(uint32_t msecToWake)
         nrf_gpio_cfg_input(PIN_BUTTON2, NRF_GPIO_PIN_PULLUP);
         nrf_gpio_pin_sense_t sense1 = NRF_GPIO_PIN_SENSE_LOW;
         nrf_gpio_cfg_sense_set(PIN_BUTTON2, sense1);
+#endif
+
+#ifdef RAK4630
+        // Configure button wake-up for RAK4631 devices
+        LOG_DEBUG("Configuring button wake-up for RAK4631");
+        nrf_gpio_cfg_input(PIN_BUTTON1, NRF_GPIO_PIN_PULLUP);
+        nrf_gpio_pin_sense_t sense_rak = NRF_GPIO_PIN_SENSE_LOW;
+        nrf_gpio_cfg_sense_set(PIN_BUTTON1, sense_rak);
 #endif
 
         auto ok = sd_power_system_off();
