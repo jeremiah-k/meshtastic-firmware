@@ -234,7 +234,10 @@ class NodeDB
 
     meshtastic_NodeInfoLite *getMeshNodeByIndex(size_t x)
     {
-        assert(x < numMeshNodes);
+        if (x >= numMeshNodes) {
+            LOG_ERROR("getMeshNodeByIndex: index %zu >= numMeshNodes %zu", x, numMeshNodes);
+            return nullptr;
+        }
         return &meshNodes->at(x);
     }
 

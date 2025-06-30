@@ -1000,7 +1000,10 @@ void NodeDB::cleanupMeshDB()
                     meshNodes->at(i).user.public_key.size = 0;
                 }
             }
-            meshNodes->at(newPos++) = meshNodes->at(i);
+            // Only copy if we need to move the element (avoid self-assignment)
+            if (newPos != i)
+                meshNodes->at(newPos) = meshNodes->at(i);
+            newPos++;
         } else {
             removed++;
         }
@@ -1088,7 +1091,11 @@ LoadFileResult NodeDB::loadProto(const char *filename, size_t protoSize, size_t 
         LOG_INFO("Load %s", filename);
         pb_istream_t stream = {&readcb, &f, protoSize};
 
-        memset(dest_struct, 0, objSize);
+        // Don't memset structures that contain std::vector (like NodeDatabase)
+        // as it corrupts the vector's internal pointers
+        if (fields != &meshtastic_NodeDatabase_msg) {
+            memset(dest_struct, 0, objSize);
+        }
         if (!pb_decode(&stream, fields, dest_struct)) {
             LOG_ERROR("Error: can't decode protobuf %s", PB_GET_ERROR(&stream));
             state = LoadFileResult::DECODE_FAILED;
@@ -1694,22 +1701,29 @@ void NodeDB::sortMeshDB()
 {
     if (!Throttle::isWithinTimespanMs(lastSort, 1000 * 5)) {
         lastSort = millis();
-        std::sort(meshNodes->begin(), meshNodes->begin() + numMeshNodes,
-                  [](const meshtastic_NodeInfoLite &a, const meshtastic_NodeInfoLite &b) {
-                      if (a.num == myNodeInfo.my_node_num && b.num == myNodeInfo.my_node_num) // in theory impossible
-                          return false;
-                      if (a.num == myNodeInfo.my_node_num) {
-                          return true;
-                      }
-                      if (b.num == myNodeInfo.my_node_num) {
-                          return false;
-                      }
-                      bool aFav = a.is_favorite;
-                      bool bFav = b.is_favorite;
-                      if (aFav != bFav)
-                          return aFav;
-                      return a.last_heard > b.last_heard;
-                  });
+
+        // Don't sort if we have fewer than 2 nodes
+        if (numMeshNodes < 2) {
+            LOG_DEBUG("Not enough nodes to sort (%d)", numMeshNodes);
+            return;
+        }
+
+        // Use bubble sort instead of std::sort to avoid vector move/swap issues
+        // that can cause crashes with complex NodeInfoLite structures
+        bool changed = true;
+        while (changed) { // dumb reverse bubble sort, but probably not bad for what we're doing
+            changed = false;
+            for (int i = numMeshNodes - 1; i > 1; i--) { // lowest case this should examine is i == 2
+                if (meshNodes->at(i).is_favorite && !meshNodes->at(i - 1).is_favorite) {
+                    std::swap(meshNodes->at(i), meshNodes->at(i - 1));
+                    changed = true;
+                } else if (meshNodes->at(i).last_heard > meshNodes->at(i - 1).last_heard) {
+                    std::swap(meshNodes->at(i), meshNodes->at(i - 1));
+                    changed = true;
+                }
+            }
+        }
+        LOG_INFO("Sort took %u milliseconds", millis() - lastSort);
     }
 }
 

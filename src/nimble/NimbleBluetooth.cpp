@@ -4,11 +4,14 @@
 #include "NimbleBluetooth.h"
 #include "PowerFSM.h"
 
+#include "concurrency/OSThread.h"
 #include "main.h"
 #include "mesh/PhoneAPI.h"
 #include "mesh/mesh-pb-constants.h"
 #include "sleep.h"
 #include <NimBLEDevice.h>
+#include <array>
+#include <mutex>
 
 NimBLECharacteristic *fromNumCharacteristic;
 NimBLECharacteristic *BatteryCharacteristic;
@@ -17,8 +20,15 @@ NimBLEServer *bleServer;
 
 static bool passkeyShowing;
 
-class BluetoothPhoneAPI : public PhoneAPI
+class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
 {
+  public:
+    std::array<std::string, 3> nimble_queue;
+    std::mutex nimble_mutex;
+    int queue_size = 0;
+
+    BluetoothPhoneAPI() : PhoneAPI(), OSThread("BluetoothPhoneAPI") {}
+
     /**
      * Subclasses can use this as a hook to provide custom notifications for their transport (i.e. bluetooth notifies)
      */
@@ -37,6 +47,28 @@ class BluetoothPhoneAPI : public PhoneAPI
 
     /// Check the current underlying physical link to see if the client is currently connected
     virtual bool checkIsConnected() { return bleServer && bleServer->getConnectedCount() > 0; }
+
+    int32_t runOnce() override
+    {
+        std::lock_guard<std::mutex> guard(nimble_mutex);
+        if (queue_size > 0) {
+            // Process the first item in queue
+            auto val = nimble_queue[0];
+            PhoneAPI::handleToRadio((const uint8_t *)val.data(), val.length());
+
+            // Shift queue items down
+            for (int i = 0; i < queue_size - 1; i++) {
+                nimble_queue[i] = nimble_queue[i + 1];
+            }
+            queue_size--;
+
+            // If more items in queue, run again immediately
+            if (queue_size > 0) {
+                return 0;
+            }
+        }
+        return 100; // Check again in 100ms if queue is empty
+    }
 };
 
 static BluetoothPhoneAPI *bluetoothPhoneAPI;
@@ -57,7 +89,18 @@ class NimbleBluetoothToRadioCallback : public NimBLECharacteristicCallbacks
         if (memcmp(lastToRadio, val.data(), val.length()) != 0) {
             LOG_DEBUG("New ToRadio packet");
             memcpy(lastToRadio, val.data(), val.length());
-            bluetoothPhoneAPI->handleToRadio(val.data(), val.length());
+
+            // Queue the packet instead of processing directly to avoid concurrency issues
+            {
+                std::lock_guard<std::mutex> guard(bluetoothPhoneAPI->nimble_mutex);
+                if (bluetoothPhoneAPI->queue_size < 3) {
+                    bluetoothPhoneAPI->nimble_queue[bluetoothPhoneAPI->queue_size] = val;
+                    bluetoothPhoneAPI->queue_size++;
+                    bluetoothPhoneAPI->setIntervalFromNow(0); // Process immediately
+                } else {
+                    LOG_WARN("Bluetooth queue full, dropping packet");
+                }
+            }
         } else {
             LOG_DEBUG("Drop dup ToRadio packet we just saw");
         }
@@ -253,6 +296,7 @@ void NimbleBluetooth::setupService()
             NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_AUTHEN | NIMBLE_PROPERTY::READ_ENC, 512U);
     }
     bluetoothPhoneAPI = new BluetoothPhoneAPI();
+    bluetoothPhoneAPI->setInterval(100); // Start the thread with 100ms interval
 
     toRadioCallbacks = new NimbleBluetoothToRadioCallback();
     ToRadioCharacteristic->setCallbacks(toRadioCallbacks);
