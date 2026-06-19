@@ -111,7 +111,7 @@ bool renameFile(const char *pathFrom, const char *pathTo)
  * @param levels The number of levels of subdirectories to list.
  * @return A vector of strings containing the full path of each file in the directory.
  */
-std::vector<meshtastic_FileInfo> getFiles(const char *dirname, uint8_t levels)
+std::vector<meshtastic_FileInfo> getFiles(const char *dirname, uint8_t levels, size_t maxCount)
 {
     std::vector<meshtastic_FileInfo> filenames = {};
 #ifdef FSCom
@@ -123,12 +123,16 @@ std::vector<meshtastic_FileInfo> getFiles(const char *dirname, uint8_t levels)
 
     File file = root.openNextFile();
     while (file) {
+        if (filenames.size() >= maxCount) {
+            file.close();
+            break;
+        }
         if (file.isDirectory() && !String(file.name()).endsWith(".")) {
             if (levels) {
 #ifdef ARCH_ESP32
-                std::vector<meshtastic_FileInfo> subDirFilenames = getFiles(file.path(), levels - 1);
+                std::vector<meshtastic_FileInfo> subDirFilenames = getFiles(file.path(), levels - 1, maxCount - filenames.size());
 #else
-                std::vector<meshtastic_FileInfo> subDirFilenames = getFiles(file.name(), levels - 1);
+                std::vector<meshtastic_FileInfo> subDirFilenames = getFiles(file.name(), levels - 1, maxCount - filenames.size());
 #endif
                 filenames.insert(filenames.end(), subDirFilenames.begin(), subDirFilenames.end());
                 file.close();
