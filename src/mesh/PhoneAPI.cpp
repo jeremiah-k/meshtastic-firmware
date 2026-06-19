@@ -70,10 +70,14 @@ void PhoneAPI::handleStartConfig()
         state = STATE_SEND_MY_INFO;
     }
     pauseBluetoothLogging = true;
-    spiLock->lock();
-    filesManifest = getFiles("/", 10);
-    spiLock->unlock();
-    LOG_DEBUG("Got %d files in manifest", filesManifest.size());
+    // Manifest is never read on the node-info-only path (STATE_SEND_FILEMANIFEST
+    // short-circuits to sendConfigComplete), so skip the SPI lock + FS walk.
+    if (config_nonce != SPECIAL_NONCE_ONLY_NODES) {
+        spiLock->lock();
+        filesManifest = getFiles("/", 3, 64);
+        spiLock->unlock();
+        LOG_DEBUG("Got %d files in manifest", filesManifest.size());
+    }
 
     LOG_INFO("Start API client config millis=%u", millis());
     // Protect against concurrent BLE callbacks: they run in NimBLE's FreeRTOS task and also touch nodeInfoQueue.
