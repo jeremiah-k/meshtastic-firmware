@@ -38,7 +38,7 @@ bool heartbeatReceived = false;
 
 namespace
 {
-constexpr uint8_t kFilesManifestLevels = 10;
+constexpr uint8_t kFilesManifestLevels = 3;
 constexpr size_t kFilesManifestMaxCount = 64;
 
 void releaseFilesManifest(std::vector<meshtastic_FileInfo> &filesManifest)

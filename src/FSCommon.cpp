@@ -99,11 +99,19 @@ bool renameFile(const char *pathFrom, const char *pathTo)
 #endif
 }
 
+#include <cstring>
+#include <new>
 #include <vector>
 
 #ifdef FSCom
 namespace
 {
+bool pathEndsWithDot(const char *path)
+{
+    size_t length = strlen(path);
+    return length > 0 && path[length - 1] == '.';
+}
+
 void collectFiles(const char *dirname, uint8_t levels, size_t maxCount, std::vector<meshtastic_FileInfo> &filenames,
                   bool *wasLimited)
 {
@@ -123,7 +131,7 @@ void collectFiles(const char *dirname, uint8_t levels, size_t maxCount, std::vec
             file.close();
             break;
         }
-        if (file.isDirectory() && !String(file.name()).endsWith(".")) {
+        if (file.isDirectory() && !pathEndsWithDot(file.name())) {
             if (levels) {
 #ifdef ARCH_ESP32
                 collectFiles(file.path(), levels - 1, maxCount, filenames, wasLimited);
@@ -141,7 +149,7 @@ void collectFiles(const char *dirname, uint8_t levels, size_t maxCount, std::vec
 #else
             strlcpy(fileInfo.file_name, file.name(), sizeof(fileInfo.file_name));
 #endif
-            if (!String(fileInfo.file_name).endsWith(".")) {
+            if (!pathEndsWithDot(fileInfo.file_name)) {
                 filenames.push_back(fileInfo);
             }
             file.close();
@@ -171,6 +179,20 @@ std::vector<meshtastic_FileInfo> getFiles(const char *dirname, uint8_t levels, s
     if (wasLimited)
         *wasLimited = false;
 #ifdef FSCom
+    size_t reservedCount = maxCount;
+    while (reservedCount > 0) {
+        try {
+            filenames.reserve(reservedCount);
+            break;
+        } catch (const std::bad_alloc &) {
+            reservedCount /= 2;
+        }
+    }
+    if (reservedCount < maxCount) {
+        if (wasLimited)
+            *wasLimited = true;
+        maxCount = reservedCount;
+    }
     collectFiles(dirname, levels, maxCount, filenames, wasLimited);
 #endif
     return filenames;
