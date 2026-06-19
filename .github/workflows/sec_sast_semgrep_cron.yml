@@ -3,8 +3,6 @@ name: Semgrep Full Scan
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: 0 1 * * 6
 
 permissions:
   actions: read
