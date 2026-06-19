@@ -36,6 +36,17 @@
 // Flag to indicate a heartbeat was received and we should send queue status
 bool heartbeatReceived = false;
 
+namespace
+{
+constexpr uint8_t kFilesManifestLevels = 10;
+constexpr size_t kFilesManifestMaxCount = 64;
+
+void releaseFilesManifest(std::vector<meshtastic_FileInfo> &filesManifest)
+{
+    std::vector<meshtastic_FileInfo>().swap(filesManifest);
+}
+} // namespace
+
 PhoneAPI::PhoneAPI()
 {
     lastContactMsec = millis();
@@ -73,10 +84,19 @@ void PhoneAPI::handleStartConfig()
     // Manifest is never read on the node-info-only path (STATE_SEND_FILEMANIFEST
     // short-circuits to sendConfigComplete), so skip the SPI lock + FS walk.
     if (config_nonce != SPECIAL_NONCE_ONLY_NODES) {
-        spiLock->lock();
-        filesManifest = getFiles("/", 3, 64);
-        spiLock->unlock();
-        LOG_DEBUG("Got %d files in manifest", filesManifest.size());
+        bool filesManifestLimited = false;
+        {
+            concurrency::LockGuard guard(spiLock);
+            filesManifest = getFiles("/", kFilesManifestLevels, kFilesManifestMaxCount, &filesManifestLimited);
+        }
+        if (filesManifestLimited) {
+            LOG_WARN("Got %zu files in manifest (limited to %zu entries/depth %u)", filesManifest.size(), kFilesManifestMaxCount,
+                     static_cast<unsigned>(kFilesManifestLevels));
+        } else {
+            LOG_DEBUG("Got %zu files in manifest", filesManifest.size());
+        }
+    } else {
+        releaseFilesManifest(filesManifest);
     }
 
     LOG_INFO("Start API client config millis=%u", millis());
@@ -126,8 +146,7 @@ void PhoneAPI::close()
             nodeInfoQueue.clear();
         }
         packetForPhone = NULL;
-        filesManifest.clear();
-        filesManifest.shrink_to_fit();
+        releaseFilesManifest(filesManifest);
         lastPortNumToRadio.clear();
         fromRadioNum = 0;
         config_nonce = 0;
@@ -536,7 +555,7 @@ size_t PhoneAPI::getFromRadio(uint8_t *buf)
         if (config_state == filesManifest.size() ||
             config_nonce == SPECIAL_NONCE_ONLY_NODES) { // also handles an empty filesManifest
             config_state = 0;
-            filesManifest.clear();
+            releaseFilesManifest(filesManifest);
             // Skip to complete packet
             sendConfigComplete();
         } else {

@@ -101,48 +101,45 @@ bool renameFile(const char *pathFrom, const char *pathTo)
 
 #include <vector>
 
-/**
- * @brief Get the list of files in a directory.
- *
- * This function returns a list of files in a directory. The list includes the full path of each file.
- * We can't use SPILOCK here because of recursion. Callers of this function should use SPILOCK.
- *
- * @param dirname The name of the directory.
- * @param levels The number of levels of subdirectories to list.
- * @return A vector of strings containing the full path of each file in the directory.
- */
-std::vector<meshtastic_FileInfo> getFiles(const char *dirname, uint8_t levels, size_t maxCount)
-{
-    std::vector<meshtastic_FileInfo> filenames = {};
 #ifdef FSCom
+namespace
+{
+void collectFiles(const char *dirname, uint8_t levels, size_t maxCount, std::vector<meshtastic_FileInfo> &filenames,
+                  bool *wasLimited)
+{
     File root = FSCom.open(dirname, FILE_O_READ);
     if (!root)
-        return filenames;
-    if (!root.isDirectory())
-        return filenames;
+        return;
+    if (!root.isDirectory()) {
+        root.close();
+        return;
+    }
 
     File file = root.openNextFile();
     while (file) {
         if (filenames.size() >= maxCount) {
+            if (wasLimited)
+                *wasLimited = true;
             file.close();
             break;
         }
         if (file.isDirectory() && !String(file.name()).endsWith(".")) {
             if (levels) {
 #ifdef ARCH_ESP32
-                std::vector<meshtastic_FileInfo> subDirFilenames = getFiles(file.path(), levels - 1, maxCount - filenames.size());
+                collectFiles(file.path(), levels - 1, maxCount, filenames, wasLimited);
 #else
-                std::vector<meshtastic_FileInfo> subDirFilenames = getFiles(file.name(), levels - 1, maxCount - filenames.size());
+                collectFiles(file.name(), levels - 1, maxCount, filenames, wasLimited);
 #endif
-                filenames.insert(filenames.end(), subDirFilenames.begin(), subDirFilenames.end());
-                file.close();
+            } else if (wasLimited) {
+                *wasLimited = true;
             }
+            file.close();
         } else {
             meshtastic_FileInfo fileInfo = {"", static_cast<uint32_t>(file.size())};
 #ifdef ARCH_ESP32
-            strcpy(fileInfo.file_name, file.path());
+            strlcpy(fileInfo.file_name, file.path(), sizeof(fileInfo.file_name));
 #else
-            strcpy(fileInfo.file_name, file.name());
+            strlcpy(fileInfo.file_name, file.name(), sizeof(fileInfo.file_name));
 #endif
             if (!String(fileInfo.file_name).endsWith(".")) {
                 filenames.push_back(fileInfo);
@@ -152,6 +149,29 @@ std::vector<meshtastic_FileInfo> getFiles(const char *dirname, uint8_t levels, s
         file = root.openNextFile();
     }
     root.close();
+}
+} // namespace
+#endif
+
+/**
+ * @brief Get the list of files in a directory.
+ *
+ * This function returns a list of files in a directory. The list includes the full path of each file.
+ * We can't use SPILOCK here because of recursion. Callers of this function should use SPILOCK.
+ *
+ * @param dirname The name of the directory.
+ * @param levels The number of levels of subdirectories to list.
+ * @param maxCount The maximum number of file entries to return.
+ * @param wasLimited Set to true if maxCount or levels prevented a complete recursive listing.
+ * @return A vector of file metadata containing the full path of each file in the directory.
+ */
+std::vector<meshtastic_FileInfo> getFiles(const char *dirname, uint8_t levels, size_t maxCount, bool *wasLimited)
+{
+    std::vector<meshtastic_FileInfo> filenames = {};
+    if (wasLimited)
+        *wasLimited = false;
+#ifdef FSCom
+    collectFiles(dirname, levels, maxCount, filenames, wasLimited);
 #endif
     return filenames;
 }
