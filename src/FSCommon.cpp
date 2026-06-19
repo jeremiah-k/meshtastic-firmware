@@ -179,6 +179,7 @@ std::vector<meshtastic_FileInfo> getFiles(const char *dirname, uint8_t levels, s
     if (wasLimited)
         *wasLimited = false;
 #ifdef FSCom
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS)
     size_t reservedCount = maxCount;
     while (reservedCount > 0) {
         try {
@@ -188,11 +189,17 @@ std::vector<meshtastic_FileInfo> getFiles(const char *dirname, uint8_t levels, s
             reservedCount /= 2;
         }
     }
+    if (reservedCount == 0) {
+        if (wasLimited)
+            *wasLimited = true;
+        return filenames;
+    }
     if (reservedCount < maxCount) {
         if (wasLimited)
             *wasLimited = true;
         maxCount = reservedCount;
     }
+#endif
     collectFiles(dirname, levels, maxCount, filenames, wasLimited);
 #endif
     return filenames;
