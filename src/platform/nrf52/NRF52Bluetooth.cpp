@@ -7,8 +7,12 @@
 #include "main.h"
 #include "mesh/PhoneAPI.h"
 #include "mesh/mesh-pb-constants.h"
+#include "platform/nrf52/BleLifelineTrace.h"
 #include <bluefruit.h>
 #include <utility/bonding.h>
+
+namespace ble_lifeline = nrf52::ble_lifeline;
+
 static BLEService meshBleService = BLEService(BLEUuid(MESH_SERVICE_UUID_16));
 static BLECharacteristic fromNum = BLECharacteristic(BLEUuid(FROMNUM_UUID_16));
 static BLECharacteristic fromRadio = BLECharacteristic(BLEUuid(FROMRADIO_UUID_16));
@@ -59,6 +63,8 @@ static BluetoothPhoneAPI *bluetoothPhoneAPI;
 
 void onConnect(uint16_t conn_handle)
 {
+    ble_lifeline::trace(ble_lifeline::Event::BleConnect, 0, conn_handle);
+
     // Get the reference to current connection
     BLEConnection *connection = Bluefruit.Connection(conn_handle);
     connectionHandle = conn_handle;
@@ -77,6 +83,7 @@ void onConnect(uint16_t conn_handle)
  */
 void onDisconnect(uint16_t conn_handle, uint8_t reason)
 {
+    ble_lifeline::trace(ble_lifeline::Event::BleDisconnect, reason, conn_handle);
     LOG_INFO("BLE Disconnected, reason = 0x%x", reason);
     if (bluetoothPhoneAPI) {
         bluetoothPhoneAPI->close();
@@ -142,6 +149,7 @@ void startAdv(void)
     Bluefruit.Advertising.setInterval(32, 668); // in unit of 0.625 ms
     Bluefruit.Advertising.setFastTimeout(30);   // number of seconds in fast mode
     Bluefruit.Advertising.start(0); // 0 = Don't stop advertising after n seconds.  FIXME, we should stop advertising after X
+    ble_lifeline::trace(ble_lifeline::Event::BleAdvertisingStart);
 }
 // Just ack that the caller is allowed to read
 static void authorizeRead(uint16_t conn_hdl)
@@ -169,6 +177,7 @@ void onFromRadioAuthorize(uint16_t conn_hdl, BLECharacteristic *chr, ble_gatts_e
 
 void onToRadioWrite(uint16_t conn_hdl, BLECharacteristic *chr, uint8_t *data, uint16_t len)
 {
+    ble_lifeline::trace(ble_lifeline::Event::BleToRadioWrite, 0, len);
     LOG_INFO("toRadioWriteCb data %p, len %u", data, len);
     if (memcmp(lastToRadio, data, len) != 0) {
         LOG_DEBUG("New ToRadio packet");
@@ -229,6 +238,7 @@ void setupMeshService(void)
 static uint32_t configuredPasskey;
 void NRF52Bluetooth::shutdown()
 {
+    ble_lifeline::trace(ble_lifeline::Event::BleShutdownCalled);
     if (!active) {
         LOG_DEBUG("NRF52 bluetooth already disabled");
         return;
@@ -239,6 +249,7 @@ void NRF52Bluetooth::shutdown()
     Bluefruit.Security.setPairPasskeyCallback(NRF52Bluetooth::onUnwantedPairing); // Actively refuse (during factory reset)
     disconnect();
     Bluefruit.Advertising.stop();
+    ble_lifeline::trace(ble_lifeline::Event::BleAdvertisingStop);
     active = false;
 }
 void NRF52Bluetooth::startDisabled()
@@ -300,6 +311,8 @@ void NRF52Bluetooth::restoreSecurityState()
 
 void NRF52Bluetooth::setup()
 {
+    ble_lifeline::trace(ble_lifeline::Event::BleSetupCalled);
+
     // Initialise the Bluefruit module
     LOG_INFO("Init the Bluefruit nRF52 module");
     Bluefruit.autoConnLed(false);
@@ -383,6 +396,7 @@ void NRF52Bluetooth::setup()
 }
 void NRF52Bluetooth::resumeAdvertising()
 {
+    ble_lifeline::trace(ble_lifeline::Event::BleResumeAdvertisingCalled);
     if (active) {
         LOG_DEBUG("NRF52 BLE advertising already active");
         return;
@@ -396,6 +410,7 @@ void NRF52Bluetooth::resumeAdvertising()
     Bluefruit.Advertising.setInterval(32, 668); // in unit of 0.625 ms
     Bluefruit.Advertising.setFastTimeout(30);   // number of seconds in fast mode
     Bluefruit.Advertising.start(0);
+    ble_lifeline::trace(ble_lifeline::Event::BleAdvertisingStart);
     active = true;
 }
 /// Given a level between 0-100, update the BLE attribute
@@ -413,10 +428,12 @@ void NRF52Bluetooth::clearBonds()
 }
 void NRF52Bluetooth::onConnectionSecured(uint16_t conn_handle)
 {
+    ble_lifeline::trace(ble_lifeline::Event::BleConnectionSecured, 0, conn_handle);
     LOG_INFO("BLE connection secured");
 }
 bool NRF52Bluetooth::onPairingPasskey(uint16_t conn_handle, uint8_t const passkey[6], bool match_request)
 {
+    ble_lifeline::trace(ble_lifeline::Event::BlePairingPasskey, match_request ? 1 : 0, conn_handle);
     LOG_INFO("BLE pair process started: match_request=%i", match_request);
     powerFSM.trigger(EVENT_BLUETOOTH_PAIR);
 
@@ -471,6 +488,7 @@ bool NRF52Bluetooth::onPairingPasskey(uint16_t conn_handle, uint8_t const passke
 // On NRF52Bluetooth::shutdown, we change the pairing callback to this method, to aggressively refuse any connection attempts.
 bool NRF52Bluetooth::onUnwantedPairing(uint16_t conn_handle, uint8_t const passkey[6], bool match_request)
 {
+    ble_lifeline::trace(ble_lifeline::Event::BleUnwantedPairing, match_request ? 1 : 0, conn_handle);
     LOG_WARN("Rejecting BLE pairing (onUnwantedPairing) - should only fire while Bluetooth is disabled");
     NRF52Bluetooth::disconnect();
     return false;

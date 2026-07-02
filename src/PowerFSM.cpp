@@ -16,12 +16,15 @@
 #include "graphics/Screen.h"
 #include "main.h"
 #include "modules/StatusLEDModule.h"
+#include "platform/nrf52/BleLifelineTrace.h"
 #include "sleep.h"
 #include "target_specific.h"
 
 #if HAS_WIFI && !defined(ARCH_PORTDUINO) || defined(MESHTASTIC_EXCLUDE_WIFI)
 #include "mesh/wifi/WiFiAPClient.h"
 #endif
+
+namespace ble_lifeline = nrf52::ble_lifeline;
 
 #ifndef SLEEP_TIME
 #define SLEEP_TIME 30
@@ -75,6 +78,7 @@ extern Power *power;
 static void shutdownEnter()
 {
     LOG_POWERFSM("State: SHUTDOWN");
+    ble_lifeline::trace(ble_lifeline::Event::PowerShutdownEnter);
     shutdownAtMsec = millis();
 }
 
@@ -177,14 +181,21 @@ static void nbEnter()
 static void darkEnter()
 {
     LOG_POWERFSM("State: darkEnter");
+    ble_lifeline::trace(ble_lifeline::Event::PowerDarkEnter);
     setBluetoothEnable(true);
     if (screen)
         screen->setOn(false);
 }
 
+static void darkExit()
+{
+    ble_lifeline::trace(ble_lifeline::Event::PowerDarkExit);
+}
+
 static void serialEnter()
 {
     LOG_POWERFSM("State: serialEnter");
+    ble_lifeline::trace(ble_lifeline::Event::PowerSerialEnter);
     setBluetoothEnable(false);
     if (screen) {
         screen->setOn(true);
@@ -194,6 +205,7 @@ static void serialEnter()
 static void serialExit()
 {
     LOG_POWERFSM("State: serialExit");
+    ble_lifeline::trace(ble_lifeline::Event::PowerSerialExit);
     // Turn bluetooth back on when we leave serial stream API
     setBluetoothEnable(true);
 }
@@ -201,6 +213,7 @@ static void serialExit()
 static void powerEnter()
 {
     LOG_POWERFSM("State: powerEnter");
+    ble_lifeline::trace(ble_lifeline::Event::PowerEnter);
     if (!isPowered()) {
         // If we got here, we are in the wrong state - we should be in powered, let that state handle things
         LOG_INFO("Loss of power in Powered");
@@ -226,15 +239,22 @@ static void powerIdle()
 static void powerExit()
 {
     LOG_POWERFSM("State: powerExit");
+    ble_lifeline::trace(ble_lifeline::Event::PowerExit);
     setBluetoothEnable(true);
 }
 
 static void onEnter()
 {
     LOG_POWERFSM("State: onEnter");
+    ble_lifeline::trace(ble_lifeline::Event::PowerOnEnter);
     if (screen)
         screen->setOn(true);
     setBluetoothEnable(true);
+}
+
+static void onExit()
+{
+    ble_lifeline::trace(ble_lifeline::Event::PowerOnExit);
 }
 
 static void onIdle()
@@ -256,10 +276,10 @@ State stateSDS(sdsEnter, NULL, NULL, "SDS");
 State stateLowBattSDS(lowBattSDSEnter, NULL, NULL, "SDS");
 State stateLS(lsEnter, lsIdle, lsExit, "LS");
 State stateNB(nbEnter, NULL, NULL, "NB");
-State stateDARK(darkEnter, NULL, NULL, "DARK");
+State stateDARK(darkEnter, NULL, darkExit, "DARK");
 State stateSERIAL(serialEnter, NULL, serialExit, "SERIAL");
 State stateBOOT(bootEnter, NULL, NULL, "BOOT");
-State stateON(onEnter, onIdle, NULL, "ON");
+State stateON(onEnter, onIdle, onExit, "ON");
 State statePOWER(powerEnter, powerIdle, powerExit, "POWER");
 Fsm powerFSM(&stateBOOT);
 
