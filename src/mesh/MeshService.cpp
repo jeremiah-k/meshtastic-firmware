@@ -19,9 +19,12 @@
 #include "modules/NodeInfoModule.h"
 #include "modules/PositionModule.h"
 #include "modules/RoutingModule.h"
+#include "platform/nrf52/BleLifelineTrace.h"
 #include "power.h"
 #include <assert.h>
 #include <string>
+
+namespace ble_lifeline = nrf52::ble_lifeline;
 
 #if ARCH_PORTDUINO
 #include "PortduinoGlue.h"
@@ -84,6 +87,7 @@ void MeshService::init()
 
 int MeshService::handleFromRadio(const meshtastic_MeshPacket *mp)
 {
+    ble_lifeline::trace(ble_lifeline::Event::MeshPacketForPhone);
     powerFSM.trigger(EVENT_PACKET_FOR_PHONE); // Possibly keep the node from sleeping
 
     nodeDB->updateFrom(*mp); // update our DB state based off sniffing every RX packet from the radio

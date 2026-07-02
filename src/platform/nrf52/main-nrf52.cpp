@@ -23,12 +23,15 @@
 #include "error.h"
 #include "main.h"
 #include "meshUtils.h"
+#include "platform/nrf52/BleLifelineTrace.h"
 #include "power.h"
 #include <power/PowerHAL.h>
 
 #include "Nrf52SaadcLock.h"
 #include "concurrency/LockGuard.h"
 #include <hal/nrf_lpcomp.h>
+
+namespace ble_lifeline = nrf52::ble_lifeline;
 
 #ifdef BQ25703A_ADDR
 #include "BQ25713.h"
@@ -189,6 +192,8 @@ void getMacAddr(uint8_t *dmac)
 #if !MESHTASTIC_EXCLUDE_BLUETOOTH
 void setBluetoothEnable(bool enable)
 {
+    ble_lifeline::trace(enable ? ble_lifeline::Event::BleEnableRequested : ble_lifeline::Event::BleDisableRequested);
+
     // For debugging use: don't use bluetooth
     if (!useSoftDevice) {
         if (enable)
@@ -221,6 +226,7 @@ void setBluetoothEnable(bool enable)
             nrf52Bluetooth->resumeAdvertising();
             powerMon->setState(meshtastic_PowerMon_State_BT_On);
         } else {
+            ble_lifeline::trace(ble_lifeline::Event::BleEnableAlreadyActive);
             LOG_DEBUG("NRF52 Bluetooth already enabled");
         }
     }
@@ -229,6 +235,7 @@ void setBluetoothEnable(bool enable)
         powerMon->clearState(meshtastic_PowerMon_State_BT_On);
         nrf52Bluetooth->shutdown();
     } else {
+        ble_lifeline::trace(ble_lifeline::Event::BleDisableAlreadyInactive);
         LOG_DEBUG("NRF52 Bluetooth already disabled");
     }
 }
