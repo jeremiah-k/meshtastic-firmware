@@ -2,12 +2,14 @@
 
 #include "BluetoothCommon.h"
 #include <Arduino.h>
+#include <atomic>
 
 class NRF52Bluetooth : BluetoothApi
 {
   public:
     void setup();
     void shutdown();
+    void processPendingShutdown();
     void startDisabled();
     void resumeAdvertising();
     void clearBonds();
@@ -18,6 +20,7 @@ class NRF52Bluetooth : BluetoothApi
 
   private:
     bool active = false;
+    std::atomic<bool> shutdownPending{false};
 
     static void onConnectionSecured(uint16_t conn_handle);
     static bool onPairingPasskey(uint16_t conn_handle, uint8_t const passkey[6], bool match_request);

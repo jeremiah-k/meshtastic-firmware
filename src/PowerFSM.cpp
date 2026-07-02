@@ -196,6 +196,7 @@ static void serialEnter()
 {
     LOG_POWERFSM("State: serialEnter");
     ble_lifeline::trace(ble_lifeline::Event::PowerSerialEnter);
+    ble_lifeline::dumpToLogOnce();
     setBluetoothEnable(false);
     if (screen) {
         screen->setOn(true);
@@ -213,7 +214,7 @@ static void serialExit()
 static void powerEnter()
 {
     LOG_POWERFSM("State: powerEnter");
-    ble_lifeline::trace(ble_lifeline::Event::PowerEnter);
+    ble_lifeline::trace(ble_lifeline::Event::PowerStateEnter);
     if (!isPowered()) {
         // If we got here, we are in the wrong state - we should be in powered, let that state handle things
         LOG_INFO("Loss of power in Powered");
@@ -239,7 +240,7 @@ static void powerIdle()
 static void powerExit()
 {
     LOG_POWERFSM("State: powerExit");
-    ble_lifeline::trace(ble_lifeline::Event::PowerExit);
+    ble_lifeline::trace(ble_lifeline::Event::PowerStateExit);
     setBluetoothEnable(true);
 }
 

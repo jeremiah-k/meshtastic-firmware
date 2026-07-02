@@ -351,6 +351,9 @@ void nrf52Loop()
     nrfx_wdt_channel_feed(&nrfx_wdt, nrfx_wdt_channel_id_nrf52_main);
 
     checkSDEvents();
+    if (nrf52Bluetooth) {
+        nrf52Bluetooth->processPendingShutdown();
+    }
     reportLittleFSCorruptionOnce();
 
     variant_nrf52LoopHook(); // Optional variant hook called each nrf52Loop();

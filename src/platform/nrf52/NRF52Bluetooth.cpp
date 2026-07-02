@@ -8,6 +8,7 @@
 #include "mesh/PhoneAPI.h"
 #include "mesh/mesh-pb-constants.h"
 #include "platform/nrf52/BleLifelineTrace.h"
+#include <atomic>
 #include <bluefruit.h>
 #include <utility/bonding.h>
 
@@ -38,6 +39,12 @@ static uint8_t lastToRadio[MAX_TO_FROM_RADIO_SIZE];
 
 static uint16_t connectionHandle;
 static bool passkeyShowing;
+static std::atomic<uint8_t> bleCallbackDepth{0};
+
+static bool isInBleCallback()
+{
+    return bleCallbackDepth.load(std::memory_order_relaxed) != 0;
+}
 
 class BluetoothPhoneAPI : public PhoneAPI
 {
@@ -179,6 +186,7 @@ void onToRadioWrite(uint16_t conn_hdl, BLECharacteristic *chr, uint8_t *data, ui
 {
     ble_lifeline::trace(ble_lifeline::Event::BleToRadioWrite, 0, len);
     LOG_INFO("toRadioWriteCb data %p, len %u", data, len);
+    bleCallbackDepth.fetch_add(1, std::memory_order_relaxed);
     if (memcmp(lastToRadio, data, len) != 0) {
         LOG_DEBUG("New ToRadio packet");
         memcpy(lastToRadio, data, len);
@@ -186,6 +194,7 @@ void onToRadioWrite(uint16_t conn_hdl, BLECharacteristic *chr, uint8_t *data, ui
     } else {
         LOG_DEBUG("Drop dup ToRadio packet we just saw");
     }
+    bleCallbackDepth.fetch_sub(1, std::memory_order_relaxed);
 }
 
 void setupMeshService(void)
@@ -240,7 +249,15 @@ void NRF52Bluetooth::shutdown()
 {
     ble_lifeline::trace(ble_lifeline::Event::BleShutdownCalled);
     if (!active) {
+        ble_lifeline::trace(ble_lifeline::Event::BleShutdownAlreadyInactive);
         LOG_DEBUG("NRF52 bluetooth already disabled");
+        return;
+    }
+
+    if (isInBleCallback()) {
+        shutdownPending.store(true, std::memory_order_relaxed);
+        ble_lifeline::trace(ble_lifeline::Event::BleShutdownDeferredRequested);
+        LOG_DEBUG("Defer NRF52 bluetooth shutdown from BLE callback");
         return;
     }
 
@@ -252,12 +269,23 @@ void NRF52Bluetooth::shutdown()
     ble_lifeline::trace(ble_lifeline::Event::BleAdvertisingStop);
     active = false;
 }
+void NRF52Bluetooth::processPendingShutdown()
+{
+    if (!shutdownPending.exchange(false, std::memory_order_relaxed)) {
+        return;
+    }
+
+    ble_lifeline::trace(ble_lifeline::Event::BleShutdownDeferredRun);
+    shutdown();
+}
 void NRF52Bluetooth::startDisabled()
 {
+    ble_lifeline::trace(ble_lifeline::Event::BleStartDisabledCalled);
     // Setup Bluetooth
     setup();
     // Shutdown bluetooth for minimum power draw
     Bluefruit.Advertising.stop();
+    ble_lifeline::trace(ble_lifeline::Event::BleAdvertisingStop);
     Bluefruit.setTxPower(-40); // Minimum power
     active = false;
     LOG_INFO("Disable NRF52 Bluetooth. (Workaround: tx power min, advertise stopped)");
