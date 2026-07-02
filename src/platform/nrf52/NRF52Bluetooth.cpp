@@ -518,7 +518,8 @@ bool NRF52Bluetooth::onUnwantedPairing(uint16_t conn_handle, uint8_t const passk
 {
     ble_lifeline::trace(ble_lifeline::Event::BleUnwantedPairing, match_request ? 1 : 0, conn_handle);
     LOG_WARN("Rejecting BLE pairing (onUnwantedPairing) - should only fire while Bluetooth is disabled");
-    NRF52Bluetooth::disconnect();
+    // Do not wait in the BLE callback; returning false rejects pairing.
+    Bluefruit.disconnect(conn_handle);
     return false;
 }
 
