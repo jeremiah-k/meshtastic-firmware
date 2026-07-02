@@ -12,10 +12,13 @@ class NRF52Bluetooth : BluetoothApi
     void resumeAdvertising();
     void clearBonds();
     bool isConnected();
+    bool isActive() const;
     int getRssi();
     void sendLog(const uint8_t *logMessage, size_t length);
 
   private:
+    bool active = false;
+
     static void onConnectionSecured(uint16_t conn_handle);
     static bool onPairingPasskey(uint16_t conn_handle, uint8_t const passkey[6], bool match_request);
     static void onPairingCompleted(uint16_t conn_handle, uint8_t auth_status);

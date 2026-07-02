@@ -210,22 +210,26 @@ void setBluetoothEnable(bool enable)
     }
 
     if (enable) {
-        powerMon->setState(meshtastic_PowerMon_State_BT_On);
-
         // If not yet set-up
         if (!nrf52Bluetooth) {
             LOG_DEBUG("Init NRF52 Bluetooth");
             nrf52Bluetooth = new NRF52Bluetooth();
             nrf52Bluetooth->setup();
-        }
-        // Already setup, apparently
-        else
+            powerMon->setState(meshtastic_PowerMon_State_BT_On);
+        } else if (!nrf52Bluetooth->isActive()) {
+            LOG_DEBUG("Resume NRF52 Bluetooth");
             nrf52Bluetooth->resumeAdvertising();
+            powerMon->setState(meshtastic_PowerMon_State_BT_On);
+        } else {
+            LOG_DEBUG("NRF52 Bluetooth already enabled");
+        }
     }
     // Disable (if previously set-up)
-    else if (nrf52Bluetooth) {
+    else if (nrf52Bluetooth && nrf52Bluetooth->isActive()) {
         powerMon->clearState(meshtastic_PowerMon_State_BT_On);
         nrf52Bluetooth->shutdown();
+    } else {
+        LOG_DEBUG("NRF52 Bluetooth already disabled");
     }
 }
 #else
