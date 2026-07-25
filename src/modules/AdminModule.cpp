@@ -487,10 +487,11 @@ bool AdminModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshta
         break;
     }
     case meshtastic_AdminMessage_commit_edit_settings_tag: {
-        disableBluetooth();
         LOG_INFO("Commit transaction for edited settings");
         hasOpenEditTransaction = false;
         deferredEditSegments = 0;
+        // Keep the active client transport alive long enough to deliver the commit response. saveChanges() schedules
+        // the reboot that owns final transport teardown.
         saveChanges(SEGMENT_CONFIG | SEGMENT_MODULECONFIG | SEGMENT_DEVICESTATE | SEGMENT_CHANNELS | SEGMENT_NODEDATABASE);
         flushChannelWarnings(); // one coalesced message for everything edited in this transaction
         break;
