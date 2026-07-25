@@ -18,6 +18,7 @@
 #include <BLESecurity.h>
 #include <BLEUtils.h>
 #include <atomic>
+#include <cassert>
 #include <mutex>
 
 #include "BleLogPolicy.h"
@@ -27,6 +28,7 @@
 #include "host/ble_hs.h"
 #include "host/ble_store.h"
 #ifdef ARCH_ESP32
+#include <esp_bt.h>
 #include <nvs.h>
 #include <nvs_flash.h>
 #endif
@@ -101,7 +103,63 @@ static void purgeIncompatibleBleBonds()
         ESP.restart();
     }
 }
+
+static bool unwindFailedNimbleControllerState()
+{
+#if !defined(CONFIG_BT_CONTROLLER_ENABLED) || !CONFIG_BT_CONTROLLER_ENABLED
+    // Hosted Bluetooth has a different transport lifecycle; do not retry without a proven cleanup contract.
+    return false;
+#else
+    // nimble_port_init owns host/HCI rollback; only unwind controller state exposed by the public status API.
+    // esp_nimble_hci_deinit is unsafe before its memory pools are initialized.
+    esp_bt_controller_status_t status = esp_bt_controller_get_status();
+    if (status == ESP_BT_CONTROLLER_STATUS_ENABLED) {
+        const esp_err_t disableError = esp_bt_controller_disable();
+        if (disableError != ESP_OK) {
+            LOG_ERROR("esp_bt_controller_disable failed after NimBLE init error, rc=%d", disableError);
+            return false;
+        }
+        status = esp_bt_controller_get_status();
+    }
+    if (status == ESP_BT_CONTROLLER_STATUS_INITED) {
+        const esp_err_t deinitError = esp_bt_controller_deinit();
+        if (deinitError != ESP_OK) {
+            LOG_ERROR("esp_bt_controller_deinit failed after NimBLE init error, rc=%d", deinitError);
+            return false;
+        }
+    }
+
+    status = esp_bt_controller_get_status();
+    if (status != ESP_BT_CONTROLLER_STATUS_IDLE) {
+        LOG_ERROR("Bluetooth controller remained active after NimBLE init error, status=%d", status);
+        return false;
+    }
+    return true;
 #endif
+}
+#endif
+
+namespace
+{
+constexpr uint8_t kNimbleInitRetryLimit = 3;
+constexpr uint32_t kNimbleInitRetryBaseDelayMs = 1000;
+bool pendingNimbleInitRetry = false;
+uint8_t nimbleInitRetryCount = 0;
+uint32_t nimbleInitRetryStartedAtMs = 0;
+
+constexpr uint32_t nimbleInitRetryDelayMs(uint8_t attempt)
+{
+    assert(attempt >= 1 && attempt <= kNimbleInitRetryLimit);
+    return kNimbleInitRetryBaseDelayMs << (attempt - 1);
+}
+
+void resetNimbleInitRetry()
+{
+    pendingNimbleInitRetry = false;
+    nimbleInitRetryCount = 0;
+    nimbleInitRetryStartedAtMs = 0;
+}
+} // namespace
 
 // Debugging options: careful, they slow things down quite a bit!
 // #define DEBUG_NIMBLE_ON_READ_TIMING  // uncomment to time onRead duration
@@ -258,6 +316,21 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
   protected:
     virtual int32_t runOnce() override
     {
+        if (pendingNimbleInitRetry) {
+            const uint32_t retryDelayMs = nimbleInitRetryDelayMs(nimbleInitRetryCount);
+            const uint32_t remainingMs = Throttle::remainingTimespanMs(nimbleInitRetryStartedAtMs, retryDelayMs, millis());
+            if (remainingMs != 0) {
+                return remainingMs;
+            }
+
+            pendingNimbleInitRetry = false;
+            nimbleBluetooth->setupInternal(true);
+            if (pendingNimbleInitRetry) {
+                return Throttle::remainingTimespanMs(nimbleInitRetryStartedAtMs, nimbleInitRetryDelayMs(nimbleInitRetryCount),
+                                                     millis());
+            }
+        }
+
         // Service a deferred advertising restart from onDisconnect, gated on ble_hs_synced() so we
         // never re-enter the GAP API while the host is still mid-reset. Authenticated classic ESP32 sessions reboot first.
         if (pendingStartAdvertising.exchange(false)) {
@@ -914,6 +987,7 @@ void NimbleBluetooth::shutdown()
 
 void NimbleBluetooth::deinit()
 {
+    resetNimbleInitRetry();
 #ifdef ARCH_ESP32
     LOG_INFO("Disable bluetooth until reboot");
 
@@ -989,14 +1063,21 @@ int NimbleBluetooth::getRssi()
 
 void NimbleBluetooth::setup()
 {
+    setupInternal(false);
+}
+
+void NimbleBluetooth::setupInternal(bool isRetry)
+{
     // Uncomment for testing
     // NimbleBluetooth::clearBonds();
 
     LOG_INFO("Init the NimBLE bluetooth module");
 
-    // deinit() latches these teardown guards; clear them so a re-init on the same boot (e.g. an
-    // admin disable-bluetooth followed by re-enable) doesn't leave onRead stuck draining or
-    // onDisconnect early-returning without clearing the connection handle.
+    if (!isRetry) {
+        resetNimbleInitRetry();
+    }
+
+    // Clear teardown guards so same-boot reinitialization cannot leave reads draining or disconnect cleanup bypassed.
     bleDraining = false;
     isDeInit = false;
     // A fresh NimBLE instance must not inherit deferred recovery from the previous stack.
@@ -1008,7 +1089,38 @@ void NimbleBluetooth::setup()
     purgeIncompatibleBleBonds(); // wipe bonds left in an incompatible on-disk format (post-upgrade)
 #endif
 
-    BLEDevice::init(getDeviceName());
+    if (!BLEDevice::init(getDeviceName())) {
+        bleDraining = true;
+        isDeInit = true;
+        pendingStartAdvertising = false;
+        bleServer = nullptr;
+        resetBleSessionState();
+
+#ifdef ARCH_ESP32
+        const bool retrySafe = unwindFailedNimbleControllerState();
+#else
+        const bool retrySafe = true;
+#endif
+        if (retrySafe && nimbleInitRetryCount < kNimbleInitRetryLimit) {
+            nimbleInitRetryCount++;
+            pendingNimbleInitRetry = true;
+            nimbleInitRetryStartedAtMs = millis();
+            const uint32_t retryDelayMs = nimbleInitRetryDelayMs(nimbleInitRetryCount);
+            if (!bluetoothPhoneAPI) {
+                bluetoothPhoneAPI = new BluetoothPhoneAPI();
+            }
+            bluetoothPhoneAPI->setIntervalFromNow(retryDelayMs);
+            LOG_WARN("NimBLE init failed; retry %u/%u scheduled in %ums", static_cast<unsigned>(nimbleInitRetryCount),
+                     static_cast<unsigned>(kNimbleInitRetryLimit), static_cast<unsigned>(retryDelayMs));
+        } else if (retrySafe) {
+            LOG_ERROR("NimBLE init failed after %u retries; Bluetooth remains disabled",
+                      static_cast<unsigned>(kNimbleInitRetryLimit));
+        } else {
+            LOG_ERROR("NimBLE init cleanup failed; Bluetooth remains disabled until reboot");
+        }
+        return;
+    }
+    resetNimbleInitRetry();
     BLEDevice::setPower(ESP_PWR_LVL_P9);
 
     int mtuResult = BLEDevice::setMTU(kPreferredBleMtu);
