@@ -29,11 +29,31 @@ runs:
       run: |
         python -m pip install --upgrade pip
         pip install -U --no-build-isolation --no-cache-dir "setuptools<72"
-        pip install -U platformio adafruit-nrfutil --no-build-isolation
+        # Pinned: core 6.2.0 + the current pioarduino tool-scons break ESP32 builds
+        # (SCons.Tool.FortranCommon missing). Unpin only after both are fixed.
+        pip install "platformio==6.1.19" adafruit-nrfutil --no-build-isolation
         pip install -U poetry --no-build-isolation
         pip install -U meshtastic --pre --no-build-isolation
+        # Pre-seed the tool-scons the pioarduino platform expects; the registry's
+        # newer scons (4.11.1) drops SCons.Tool.FortranCommon and breaks builds.
+        pio pkg install --global --no-save \
+          "https://github.com/pioarduino/registry/releases/download/0.0.1/scons-4.8.1.zip" || true
+        # The platform's nested build phase self-upgrades and installs scons 4.11.1
+        # regardless; seed that exact package with a FortranCommon compat shim so the
+        # import PIO still makes resolves (fortran is never invoked for ESP32 targets).
+        pio pkg install --global --no-save \
+          "https://github.com/pioarduino/scons/releases/download/4.11.1/scons-local-4.11.1.tar.gz" || true
+        for d in "$HOME/.platformio/packages"/tool-scons*; do
+          [ -d "$d" ] || continue
+          f=$(find "$d" -type d -name Tool -path "*SCons*" | head -1)
+          [ -n "$f" ] && printf '%s\n' \
+            '# PIO 6.2.0 compat: SCons >=4.9 removed this module; any attribute resolves to a no-op.' \
+            'def __getattr__(name):' \
+            '    return lambda *a, **k: None' \
+            > "$f/FortranCommon.py" || true
+        done
 
-    - name: Upgrade platformio
+    - name: Report platformio version
       shell: bash
       run: |
-        pio upgrade
+        pio --version
