@@ -1,6 +1,8 @@
 #pragma once
 #include "BluetoothCommon.h"
 
+class BluetoothPhoneAPI;
+
 class NimbleBluetooth : BluetoothApi
 {
   public:
@@ -16,6 +18,8 @@ class NimbleBluetooth : BluetoothApi
     bool isDeInit = false;
 
   private:
+    friend class BluetoothPhoneAPI;
+    void setupInternal(bool isRetry);
     void setupService();
 };
 
