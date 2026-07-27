@@ -1699,6 +1699,58 @@ static void test_editTransaction_active_isNotRetired()
     TEST_ASSERT_EQUAL_INT(1, warningsContaining("There may be name issues on channels 0, 1"));
 }
 
+static meshtastic_ModuleConfig makeMqttModuleConfig()
+{
+    meshtastic_ModuleConfig config = meshtastic_ModuleConfig_init_zero;
+    config.which_payload_variant = meshtastic_ModuleConfig_mqtt_tag;
+    config.payload_variant.mqtt = meshtastic_ModuleConfig_MQTTConfig_init_zero;
+    return config;
+}
+
+static meshtastic_ModuleConfig makeSerialModuleConfig()
+{
+    meshtastic_ModuleConfig config = meshtastic_ModuleConfig_init_zero;
+    config.which_payload_variant = meshtastic_ModuleConfig_serial_tag;
+    config.payload_variant.serial = meshtastic_ModuleConfig_SerialConfig_init_zero;
+    return config;
+}
+
+static void test_mqttConfig_standalone_disablesBluetooth()
+{
+    resetDisableBluetoothCallCountForTest();
+
+    TEST_ASSERT_TRUE(testAdmin->handleSetModuleConfig(makeMqttModuleConfig()));
+
+    TEST_ASSERT_EQUAL_UINT32(1, getDisableBluetoothCallCountForTest());
+}
+
+static void test_mqttConfig_inTransaction_preservesBluetooth()
+{
+    sendBeginEdit();
+    resetDisableBluetoothCallCountForTest();
+
+    TEST_ASSERT_TRUE(testAdmin->handleSetModuleConfig(makeMqttModuleConfig()));
+    TEST_ASSERT_EQUAL_UINT32(0, getDisableBluetoothCallCountForTest());
+}
+
+static void test_serialConfig_standalone_disablesBluetooth()
+{
+    resetDisableBluetoothCallCountForTest();
+
+    TEST_ASSERT_TRUE(testAdmin->handleSetModuleConfig(makeSerialModuleConfig()));
+
+    TEST_ASSERT_EQUAL_UINT32(1, getDisableBluetoothCallCountForTest());
+}
+
+static void test_serialConfig_inTransaction_preservesBluetooth()
+{
+    sendBeginEdit();
+    resetDisableBluetoothCallCountForTest();
+
+    TEST_ASSERT_TRUE(testAdmin->handleSetModuleConfig(makeSerialModuleConfig()));
+    TEST_ASSERT_EQUAL_UINT32(0, getDisableBluetoothCallCountForTest());
+}
+
 static void test_warn_license_noTransaction_emittedImmediately()
 {
     usePresetLongFast();
@@ -1766,6 +1818,7 @@ void setUp(void)
     service = mockMeshService;
     testAdmin = new AdminModuleTestShim();
     capturedWarnings.clear();
+    resetDisableBluetoothCallCountForTest();
     // Committing an edit transaction triggers a full saveToDisk(), which dereferences nodeDB.
     // Create it once (kept reachable via the global, so no leak) for the warning tests; the
     // other tests in this suite set their own config/region state and are unaffected.
@@ -1895,6 +1948,10 @@ void setup()
     RUN_TEST(test_editTransaction_abandoned_isRetiredOnNextAdminMessage);
     RUN_TEST(test_editTransaction_abandoned_laterWriteIsNoLongerDeferred);
     RUN_TEST(test_editTransaction_active_isNotRetired);
+    RUN_TEST(test_mqttConfig_standalone_disablesBluetooth);
+    RUN_TEST(test_mqttConfig_inTransaction_preservesBluetooth);
+    RUN_TEST(test_serialConfig_standalone_disablesBluetooth);
+    RUN_TEST(test_serialConfig_inTransaction_preservesBluetooth);
     RUN_TEST(test_warn_license_noTransaction_emittedImmediately);
     RUN_TEST(test_warn_license_transaction_coalescedToSingleMessage);
     RUN_TEST(test_commitResponse_deliveredBeforeReboot);
