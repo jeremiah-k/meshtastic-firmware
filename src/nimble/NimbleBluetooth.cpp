@@ -1,5 +1,6 @@
 #include "configuration.h"
 #if !MESHTASTIC_EXCLUDE_BLUETOOTH
+#include "AdvertisingRestartController.h"
 #include "BluetoothCommon.h"
 #include "NimbleBluetooth.h"
 #include "PowerFSM.h"
@@ -34,6 +35,12 @@ namespace
 constexpr uint16_t kPreferredBleMtu = 517;
 constexpr uint16_t kPreferredBleTxOctets = 251;
 constexpr uint16_t kPreferredBleTxTimeUs = (kPreferredBleTxOctets + 14) * 8;
+} // namespace
+
+namespace
+{
+constexpr uint32_t kAdvertisingPostDisconnectDelayMs = 250;
+constexpr uint32_t kAdvertisingRetryDelayMs = 1000;
 } // namespace
 
 #ifdef ARCH_ESP32
@@ -107,6 +114,9 @@ static std::atomic<uint16_t> nimbleBluetoothConnHandle{BLE_HS_CONN_HANDLE_NONE};
 // triggers a MIC failure + NimBLE host reset; re-entering ble_gap_adv_* from the disconnect
 // callback while the host is mid-reset crashes (LoadProhibited), so the main task does it instead.
 static std::atomic<bool> pendingStartAdvertising{false};
+// Timing is owned exclusively by BluetoothPhoneAPI::runOnce on the main task; the NimBLE callback only raises the
+// atomic pending flag. Keeping the timer out of the callback avoids another cross-task synchronization surface.
+static meshtastic::bluetooth::AdvertisingRestartController advertisingRestartController;
 
 // Set by deinit() before it disconnects. Makes onRead bail immediately instead of arming the
 // up-to-20s wait, so a read arriving mid-teardown can't pin the NimBLE task and stall the disconnect.
@@ -225,13 +235,28 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
         if (pendingStartAdvertising) {
             if (checkIsConnected()) {
                 pendingStartAdvertising = false; // a new physical connection beat us to it; nothing to do
-            } else if (ble_hs_synced()) {
-                pendingStartAdvertising = false;
-                if (nimbleBluetooth) {
-                    nimbleBluetooth->startAdvertising();
-                }
-            } else {
+                advertisingRestartController.reset();
+            } else if (!ble_hs_synced()) {
+                advertisingRestartController.reset();
                 return 200; // host still re-syncing after a reset; retry shortly
+            } else {
+                const uint32_t nowMs = millis();
+                // The disconnect callback can arrive before the controller has fully retired its ACL state. Give that
+                // state a short quiet period before re-entering advertising, then retain failed starts for retry.
+                advertisingRestartController.armIfNeeded(nowMs, kAdvertisingPostDisconnectDelayMs);
+                const uint32_t remainingMs = advertisingRestartController.remainingMs(nowMs);
+                if (remainingMs != 0) {
+                    return remainingMs;
+                }
+
+                if (nimbleBluetooth && nimbleBluetooth->startAdvertising()) {
+                    pendingStartAdvertising = false;
+                    advertisingRestartController.reset();
+                } else {
+                    // Measure the retry from the completed attempt, not from the pre-call timestamp above.
+                    advertisingRestartController.arm(millis(), kAdvertisingRetryDelayMs);
+                    return kAdvertisingRetryDelayMs;
+                }
             }
         }
 
@@ -794,7 +819,7 @@ class NimbleBluetoothServerCallback : public BLEServerCallbacks
     }
 };
 
-void NimbleBluetooth::startAdvertising()
+bool NimbleBluetooth::startAdvertising()
 {
     BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
     pAdvertising->stop();
@@ -813,9 +838,11 @@ void NimbleBluetooth::startAdvertising()
 
     if (!pAdvertising->start(0)) {
         LOG_ERROR("BLE failed to start advertising");
-    } else {
-        LOG_DEBUG("BLE Advertising started");
+        return false;
     }
+
+    LOG_DEBUG("BLE Advertising started");
+    return true;
 }
 
 void NimbleBluetooth::shutdown()
@@ -854,6 +881,7 @@ void NimbleBluetooth::deinit()
 
     isDeInit = true;
     pendingStartAdvertising = false; // stack is going away; don't let runOnce retry the adv restart
+    advertisingRestartController.reset();
 
 #ifdef BLE_LED
     digitalWrite(BLE_LED, LED_STATE_OFF);
@@ -974,7 +1002,15 @@ void NimbleBluetooth::setup()
     static NimbleBluetoothServerCallback serverCallbacks(this); // safe: NimbleBluetooth is a never-deleted singleton
     bleServer->setCallbacks(&serverCallbacks);
     setupService();
-    startAdvertising();
+    if (!startAdvertising()) {
+        // A software reboot or rapid BLE re-init can leave the controller temporarily unavailable. Preserve a retry
+        // instead of reporting one failure and remaining undiscoverable until another external lifecycle event.
+        advertisingRestartController.arm(millis(), kAdvertisingRetryDelayMs);
+        pendingStartAdvertising = true;
+        if (bluetoothPhoneAPI) {
+            bluetoothPhoneAPI->setIntervalFromNow(kAdvertisingRetryDelayMs);
+        }
+    }
 }
 
 void NimbleBluetooth::setupService()
