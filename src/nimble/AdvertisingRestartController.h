@@ -1,11 +1,17 @@
 #pragma once
 
+#include "mesh/Throttle.h"
+
 #include <cstdint>
 
 namespace meshtastic::bluetooth
 {
 
-/** Main-task timing state for a deferred BLE advertising restart. */
+/**
+ * Main-task timing state for a deferred BLE advertising restart.
+ *
+ * This class is not internally synchronized and must remain owned by one task.
+ */
 class AdvertisingRestartController
 {
   public:
@@ -23,15 +29,7 @@ class AdvertisingRestartController
         }
     }
 
-    uint32_t remainingMs(uint32_t nowMs) const
-    {
-        if (!armed) {
-            return 0;
-        }
-        // Unsigned subtraction intentionally preserves elapsed time across the millis() wraparound.
-        const uint32_t elapsedMs = nowMs - startedAtMs;
-        return elapsedMs >= waitMs ? 0 : waitMs - elapsedMs;
-    }
+    uint32_t remainingMs(uint32_t nowMs) const { return armed ? Throttle::remainingTimespanMs(startedAtMs, waitMs, nowMs) : 0; }
 
     void reset()
     {
