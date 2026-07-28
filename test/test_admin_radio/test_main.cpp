@@ -1749,6 +1749,41 @@ static void test_serialConfig_inTransaction_preservesBluetooth()
     TEST_ASSERT_EQUAL_UINT32(0, getDisableBluetoothCallCountForTest());
 }
 
+static void test_commitResponse_deliveredBeforeReboot()
+{
+    sendBeginEdit();
+    resetDisableBluetoothCallCountForTest();
+
+    sendCommitEdit();
+
+    TEST_ASSERT_FALSE(testAdmin->editTransactionOpen());
+    TEST_ASSERT_EQUAL_UINT32(0, getDisableBluetoothCallCountForTest());
+}
+
+static void test_mqttConfig_transaction_preservesBluetoothThroughCommit()
+{
+    sendBeginEdit();
+    resetDisableBluetoothCallCountForTest();
+
+    TEST_ASSERT_TRUE(testAdmin->handleSetModuleConfig(makeMqttModuleConfig()));
+    sendCommitEdit();
+
+    TEST_ASSERT_FALSE(testAdmin->editTransactionOpen());
+    TEST_ASSERT_EQUAL_UINT32(0, getDisableBluetoothCallCountForTest());
+}
+
+static void test_serialConfig_transaction_preservesBluetoothThroughCommit()
+{
+    sendBeginEdit();
+    resetDisableBluetoothCallCountForTest();
+
+    TEST_ASSERT_TRUE(testAdmin->handleSetModuleConfig(makeSerialModuleConfig()));
+    sendCommitEdit();
+
+    TEST_ASSERT_FALSE(testAdmin->editTransactionOpen());
+    TEST_ASSERT_EQUAL_UINT32(0, getDisableBluetoothCallCountForTest());
+}
+
 static void test_warn_license_noTransaction_emittedImmediately()
 {
     usePresetLongFast();
@@ -1918,6 +1953,9 @@ void setup()
     RUN_TEST(test_mqttConfig_inTransaction_preservesBluetooth);
     RUN_TEST(test_serialConfig_standalone_disablesBluetooth);
     RUN_TEST(test_serialConfig_inTransaction_preservesBluetooth);
+    RUN_TEST(test_commitResponse_deliveredBeforeReboot);
+    RUN_TEST(test_mqttConfig_transaction_preservesBluetoothThroughCommit);
+    RUN_TEST(test_serialConfig_transaction_preservesBluetoothThroughCommit);
     RUN_TEST(test_warn_license_noTransaction_emittedImmediately);
     RUN_TEST(test_warn_license_transaction_coalescedToSingleMessage);
 

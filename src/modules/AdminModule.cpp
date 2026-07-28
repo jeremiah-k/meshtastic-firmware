@@ -63,8 +63,8 @@
 #if !defined(ARCH_STM32WL) && !MESHTASTIC_EXCLUDE_I2C && !MESHTASTIC_EXCLUDE_ACCELEROMETER
 #include "motion/AccelerometerThread.h"
 #endif
-#if ((defined(ARCH_ESP32) || defined(ARCH_NRF52) || defined(ARCH_RP2040)) && !defined(CONFIG_IDF_TARGET_ESP32S2) &&             \
-     !defined(CONFIG_IDF_TARGET_ESP32C3)) ||                                                                                       \
+#if ((defined(ARCH_ESP32) || defined(ARCH_NRF52) || defined(ARCH_RP2040)) && !defined(CONFIG_IDF_TARGET_ESP32S2) &&              \
+     !defined(CONFIG_IDF_TARGET_ESP32C3)) ||                                                                                     \
     defined(PIO_UNIT_TESTING)
 #include "SerialModule.h"
 #endif
@@ -1276,8 +1276,8 @@ bool AdminModule::handleSetModuleConfig(const meshtastic_ModuleConfig &c)
         break;
     case meshtastic_ModuleConfig_serial_tag:
         LOG_INFO("Set module config: Serial");
-#if ((defined(ARCH_ESP32) || defined(ARCH_NRF52) || defined(ARCH_RP2040)) && !defined(CONFIG_IDF_TARGET_ESP32S2) &&             \
-     !defined(CONFIG_IDF_TARGET_ESP32C3)) ||                                                                                       \
+#if ((defined(ARCH_ESP32) || defined(ARCH_NRF52) || defined(ARCH_RP2040)) && !defined(CONFIG_IDF_TARGET_ESP32S2) &&              \
+     !defined(CONFIG_IDF_TARGET_ESP32C3)) ||                                                                                     \
     defined(PIO_UNIT_TESTING)
         if (!SerialModule::isValidConfig(c.payload_variant.serial)) {
             LOG_ERROR("Invalid serial config");
@@ -2496,9 +2496,15 @@ void AdminModule::warnOnLoraPresetChange(const meshtastic_Config_LoRaConfig &old
 #ifdef PIO_UNIT_TESTING
 static uint32_t disableBluetoothCallCountForTest = 0;
 
-uint32_t getDisableBluetoothCallCountForTest() { return disableBluetoothCallCountForTest; }
+uint32_t getDisableBluetoothCallCountForTest()
+{
+    return disableBluetoothCallCountForTest;
+}
 
-void resetDisableBluetoothCallCountForTest() { disableBluetoothCallCountForTest = 0; }
+void resetDisableBluetoothCallCountForTest()
+{
+    disableBluetoothCallCountForTest = 0;
+}
 #endif
 
 void disableBluetooth()
