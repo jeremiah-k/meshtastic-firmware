@@ -1,5 +1,7 @@
 #pragma once
 
+#include "mesh/Throttle.h"
+
 #include <climits>
 #include <cstdint>
 #include <mutex>
@@ -16,7 +18,6 @@ enum class ConnectionParamsMode : uint8_t { NONE, HIGH_THROUGHPUT, LOW_POWER };
 struct ConnectionParamsRequest {
     uint16_t connHandle;
     ConnectionParamsMode mode;
-    uint32_t generation;
 };
 
 /** Serializes ESP32 GAP updates while accepting peer-selected parameters that already satisfy the desired profile. */
@@ -26,6 +27,8 @@ class ConnectionParamsUpdateController
     static constexpr uint16_t NO_CONNECTION = UINT16_MAX;
     static constexpr int32_t NO_WAKE_DELAY_MS = INT32_MAX;
     static constexpr int32_t SUBMISSION_RETRY_MS = 250;
+    // Coalesce back-to-back config phases before entering the optional steady-state profile.
+    static constexpr uint32_t LOW_POWER_SETTLE_MS = 1000;
 
     static constexpr uint16_t HIGH_THROUGHPUT_MIN_INTERVAL = 6;
     static constexpr uint16_t HIGH_THROUGHPUT_MAX_INTERVAL = 12;
@@ -47,21 +50,16 @@ class ConnectionParamsUpdateController
         return generation;
     }
 
-    /** Start a fresh controller session for [connHandle]. */
-    void onConnected(uint16_t connHandle)
+    /** Start a fresh controller session for [connHandle] and return its admission token. */
+    uint32_t onConnected(uint16_t connHandle)
     {
         std::lock_guard<std::mutex> guard(stateMutex);
-        generation++;
-        connectionHandle = connHandle;
-        currentInterval = 0;
-        requestedMode = ConnectionParamsMode::NONE;
-        desiredMode = ConnectionParamsMode::NONE;
-        updateStartedAtMs = 0;
-        updateInProgress = false;
+        resetState(connHandle);
+        return generation;
     }
 
     /** Queue or replace the desired mode only if the caller still belongs to the active session. */
-    bool request(uint32_t expectedGeneration, ConnectionParamsMode mode)
+    bool request(uint32_t expectedGeneration, ConnectionParamsMode mode, uint32_t nowMs)
     {
         std::lock_guard<std::mutex> guard(stateMutex);
         if (mode == ConnectionParamsMode::NONE || connectionHandle == NO_CONNECTION || generation != expectedGeneration) {
@@ -69,13 +67,19 @@ class ConnectionParamsUpdateController
         }
 
         if (!updateInProgress && isSatisfied(mode, currentInterval)) {
-            if (desiredMode == mode) {
-                desiredMode = ConnectionParamsMode::NONE;
-            }
+            // The newest request wins even when it needs no controller procedure.
+            desiredMode = ConnectionParamsMode::NONE;
+            requestedMode = ConnectionParamsMode::NONE;
+            stateStartedAtMs = 0;
             return false;
         }
 
         desiredMode = mode;
+        if (!updateInProgress && mode == ConnectionParamsMode::LOW_POWER) {
+            // A new LOW_POWER request gets its full quiet period, which also supersedes a shorter submission backoff.
+            requestedMode = ConnectionParamsMode::NONE;
+            stateStartedAtMs = nowMs;
+        }
         return true;
     }
 
@@ -88,12 +92,18 @@ class ConnectionParamsUpdateController
         }
 
         if (updateInProgress) {
-            const uint32_t elapsedMs = nowMs - updateStartedAtMs;
-            if (elapsedMs < UPDATE_LANE_TIMEOUT_MS) {
-                return static_cast<int32_t>(UPDATE_LANE_TIMEOUT_MS - elapsedMs);
+            const uint32_t remainingMs = Throttle::remainingTimespanMs(stateStartedAtMs, UPDATE_LANE_TIMEOUT_MS, nowMs);
+            if (remainingMs != 0) {
+                return static_cast<int32_t>(remainingMs);
             }
+            const ConnectionParamsMode expiredMode = requestedMode;
             requestedMode = ConnectionParamsMode::NONE;
             updateInProgress = false;
+            if (desiredMode == ConnectionParamsMode::LOW_POWER) {
+                stateStartedAtMs = expiredMode == ConnectionParamsMode::LOW_POWER ? nowMs - LOW_POWER_SETTLE_MS : nowMs;
+            } else {
+                stateStartedAtMs = 0;
+            }
         }
 
         if (desiredMode == ConnectionParamsMode::NONE) {
@@ -101,21 +111,37 @@ class ConnectionParamsUpdateController
         }
         if (isSatisfied(desiredMode, currentInterval)) {
             desiredMode = ConnectionParamsMode::NONE;
+            requestedMode = ConnectionParamsMode::NONE;
+            stateStartedAtMs = 0;
             return NO_WAKE_DELAY_MS;
+        }
+
+        // A non-active requestedMode marks submission backoff; otherwise LOW_POWER observes its config quiet period.
+        uint32_t waitMs = 0;
+        if (requestedMode != ConnectionParamsMode::NONE) {
+            waitMs = SUBMISSION_RETRY_MS;
+        } else if (desiredMode == ConnectionParamsMode::LOW_POWER) {
+            waitMs = LOW_POWER_SETTLE_MS;
+        }
+        if (waitMs != 0) {
+            const uint32_t remainingMs = Throttle::remainingTimespanMs(stateStartedAtMs, waitMs, nowMs);
+            if (remainingMs != 0) {
+                return static_cast<int32_t>(remainingMs);
+            }
         }
 
         requestedMode = desiredMode;
         updateInProgress = true;
-        updateStartedAtMs = nowMs;
-        const ConnectionParamsRequest request{connectionHandle, requestedMode, generation};
+        stateStartedAtMs = nowMs;
+        const ConnectionParamsRequest request{connectionHandle, requestedMode};
 
         // NimBLE submission is nonblocking; retain the lock so reset/reconnect cannot retarget this handle mid-call.
         if (submitter(request)) {
             return static_cast<int32_t>(UPDATE_LANE_TIMEOUT_MS);
         }
 
-        requestedMode = ConnectionParamsMode::NONE;
         updateInProgress = false;
+        stateStartedAtMs = nowMs;
         return SUBMISSION_RETRY_MS;
     }
 
@@ -139,6 +165,7 @@ class ConnectionParamsUpdateController
 
         desiredMode = ConnectionParamsMode::NONE;
         requestedMode = ConnectionParamsMode::NONE;
+        stateStartedAtMs = 0;
         updateInProgress = false;
     }
 
@@ -146,16 +173,31 @@ class ConnectionParamsUpdateController
     void reset()
     {
         std::lock_guard<std::mutex> guard(stateMutex);
+        resetState();
+    }
+
+#ifdef PIO_UNIT_TESTING
+    /** Invoke [beforeLock] immediately before acquiring the controller lock. */
+    template <typename BeforeLock> void resetForTest(BeforeLock &&beforeLock)
+    {
+        beforeLock();
+        std::lock_guard<std::mutex> guard(stateMutex);
+        resetState();
+    }
+#endif
+
+  private:
+    void resetState(uint16_t newConnectionHandle = NO_CONNECTION)
+    {
         generation++;
-        connectionHandle = NO_CONNECTION;
+        connectionHandle = newConnectionHandle;
         currentInterval = 0;
         desiredMode = ConnectionParamsMode::NONE;
         requestedMode = ConnectionParamsMode::NONE;
-        updateStartedAtMs = 0;
+        stateStartedAtMs = 0;
         updateInProgress = false;
     }
 
-  private:
     /** Return whether [interval] already satisfies [mode]. */
     static bool isSatisfied(ConnectionParamsMode mode, uint16_t interval)
     {
@@ -175,7 +217,8 @@ class ConnectionParamsUpdateController
 
     mutable std::mutex stateMutex;
     uint32_t generation = 0;
-    uint32_t updateStartedAtMs = 0;
+    // Times the active GAP lane, or the deferred LOW_POWER request when no update is active.
+    uint32_t stateStartedAtMs = 0;
     uint16_t connectionHandle = NO_CONNECTION;
     uint16_t currentInterval = 0;
     ConnectionParamsMode desiredMode = ConnectionParamsMode::NONE;

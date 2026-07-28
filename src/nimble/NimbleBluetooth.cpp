@@ -295,7 +295,12 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
   public:
     BluetoothPhoneAPI() : concurrency::OSThread("NimbleBluetooth") { api_type = TYPE_BLE; }
 
-    void onBleConnected(uint16_t connHandle) { connectionParamsController.onConnected(connHandle); }
+#if defined(CONFIG_IDF_TARGET_ESP32)
+    void onBleConnected(uint16_t) {}
+    void onConnectionParamsUpdate(uint16_t, uint16_t, uint8_t) {}
+    void resetConnectionParams() {}
+#else
+    void onBleConnected(uint16_t connHandle) { connectionParamsGeneration = connectionParamsController.onConnected(connHandle); }
 
     void onConnectionParamsUpdate(uint16_t connHandle, uint16_t interval, uint8_t status)
     {
@@ -303,6 +308,7 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
     }
 
     void resetConnectionParams() { connectionParamsController.reset(); }
+#endif
 
     /* Packets from phone (BLE onWrite callback) */
     std::mutex fromPhoneMutex;
@@ -325,10 +331,14 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
     std::atomic<int32_t> notifyCount{0};
     std::atomic<int32_t> writeCount{0};
 
+#if !defined(CONFIG_IDF_TARGET_ESP32)
     static_assert(meshtastic::bluetooth::ConnectionParamsUpdateController::NO_CONNECTION == BLE_HS_CONN_HANDLE_NONE);
-    // ESP32's controller permits one connection-parameter procedure at a time. The main task submits it;
+    // ESP32-family controllers permit one connection-parameter procedure at a time. The main task submits it;
     // the NimBLE callback releases the lane and preserves the latest desired mode.
     meshtastic::bluetooth::ConnectionParamsUpdateController connectionParamsController;
+    // Capture the NimBLE-task session epoch for admission by config work running on the main task.
+    std::atomic<uint32_t> connectionParamsGeneration{0};
+#endif
 
   protected:
     virtual int32_t runOnce() override
@@ -577,6 +587,12 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
     /// Check the current underlying physical link to see if the client is currently connected
     virtual bool checkIsConnected() override { return nimbleBluetoothConnHandle.load() != BLE_HS_CONN_HANDLE_NONE; }
 
+#if defined(CONFIG_IDF_TARGET_ESP32)
+    // The original ESP32 closed controller panics in ea.c/ld_acl.c after locally initiated parameter procedures.
+    // Let the central select connection priority and compile the controller lane out of this constrained target.
+    void requestConnectionParams(meshtastic::bluetooth::ConnectionParamsMode) {}
+    int32_t updateConnectionParams() { return INT32_MAX; }
+#else
     void wakeForConnectionParams()
     {
         setIntervalFromNow(0);
@@ -585,8 +601,7 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
 
     void requestConnectionParams(meshtastic::bluetooth::ConnectionParamsMode mode)
     {
-        const uint32_t generation = connectionParamsController.currentGeneration();
-        if (connectionParamsController.request(generation, mode)) {
+        if (connectionParamsController.request(connectionParamsGeneration.load(), mode, millis())) {
             wakeForConnectionParams();
         }
     }
@@ -610,6 +625,7 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
                                                              return false;
                                                          });
     }
+#endif
 
     bool requestHighThroughputConnection(uint16_t conn_handle)
     {
@@ -633,10 +649,10 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
         setup. Not worth adjusting much.
         */
         LOG_INFO("BLE requestHighThroughputConnection");
-        return bleServer->requestConnParams(conn_handle, ConnectionParamsUpdateController::HIGH_THROUGHPUT_MIN_INTERVAL,
-                                            ConnectionParamsUpdateController::HIGH_THROUGHPUT_MAX_INTERVAL,
-                                            ConnectionParamsUpdateController::HIGH_THROUGHPUT_LATENCY,
-                                            ConnectionParamsUpdateController::SUPERVISION_TIMEOUT);
+        using Controller = meshtastic::bluetooth::ConnectionParamsUpdateController;
+        return bleServer->requestConnParams(conn_handle, Controller::HIGH_THROUGHPUT_MIN_INTERVAL,
+                                            Controller::HIGH_THROUGHPUT_MAX_INTERVAL, Controller::HIGH_THROUGHPUT_LATENCY,
+                                            Controller::SUPERVISION_TIMEOUT);
     }
 
     bool requestLowerPowerConnection(uint16_t conn_handle)
@@ -659,10 +675,9 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
         per second.
         */
         LOG_INFO("BLE requestLowerPowerConnection");
-        return bleServer->requestConnParams(conn_handle, ConnectionParamsUpdateController::LOW_POWER_MIN_INTERVAL,
-                                            ConnectionParamsUpdateController::LOW_POWER_MAX_INTERVAL,
-                                            ConnectionParamsUpdateController::LOW_POWER_LATENCY,
-                                            ConnectionParamsUpdateController::SUPERVISION_TIMEOUT);
+        using Controller = meshtastic::bluetooth::ConnectionParamsUpdateController;
+        return bleServer->requestConnParams(conn_handle, Controller::LOW_POWER_MIN_INTERVAL, Controller::LOW_POWER_MAX_INTERVAL,
+                                            Controller::LOW_POWER_LATENCY, Controller::SUPERVISION_TIMEOUT);
     }
 };
 
