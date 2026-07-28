@@ -1,6 +1,11 @@
 #include "MeshTypes.h"
 #include "TestUtil.h"
 #include "nimble/ConnectionParamsUpdateController.h"
+
+#include <atomic>
+#include <chrono>
+#include <optional>
+#include <thread>
 #include <unity.h>
 
 using meshtastic::bluetooth::ConnectionParamsMode;
@@ -13,88 +18,206 @@ static void assertRequest(const ConnectionParamsRequest &request, uint16_t handl
     TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(mode), static_cast<uint8_t>(request.mode));
 }
 
-static void test_connect_queues_initial_profile()
+static std::optional<ConnectionParamsRequest> serviceAt(ConnectionParamsUpdateController &controller, uint32_t nowMs,
+                                                        bool accepted = true, int32_t *nextDelayMs = nullptr)
+{
+    std::optional<ConnectionParamsRequest> submitted;
+    const int32_t delay = controller.servicePending(nowMs, [&](const ConnectionParamsRequest &request) {
+        submitted = request;
+        return accepted;
+    });
+    if (nextDelayMs != nullptr) {
+        *nextDelayMs = delay;
+    }
+    return submitted;
+}
+
+static void test_connect_waits_for_a_config_profile_request()
 {
     ConnectionParamsUpdateController controller;
-    ConnectionParamsRequest request{};
-
     controller.onConnected(7);
 
-    TEST_ASSERT_TRUE(controller.beginNext(request));
-    assertRequest(request, 7, ConnectionParamsMode::INITIAL_HIGH_THROUGHPUT);
-    TEST_ASSERT_FALSE(controller.beginNext(request));
-    TEST_ASSERT_FALSE(controller.onUpdateComplete(7));
-    TEST_ASSERT_FALSE(controller.beginNext(request));
+    TEST_ASSERT_FALSE(serviceAt(controller, 0).has_value());
+    TEST_ASSERT_TRUE(controller.request(controller.currentGeneration(), ConnectionParamsMode::HIGH_THROUGHPUT));
+
+    const auto request = serviceAt(controller, 1);
+    TEST_ASSERT_TRUE(request.has_value());
+    assertRequest(*request, 7, ConnectionParamsMode::HIGH_THROUGHPUT);
 }
 
-static void test_latest_request_wins_while_update_is_active()
+static void test_peer_high_throughput_update_avoids_redundant_submission()
 {
     ConnectionParamsUpdateController controller;
-    ConnectionParamsRequest request{};
     controller.onConnected(4);
-    TEST_ASSERT_TRUE(controller.beginNext(request));
+
+    controller.recordUpdate(4, ConnectionParamsUpdateController::HIGH_THROUGHPUT_MAX_INTERVAL, 0);
+    TEST_ASSERT_FALSE(controller.request(controller.currentGeneration(), ConnectionParamsMode::HIGH_THROUGHPUT));
+    TEST_ASSERT_FALSE(serviceAt(controller, 0).has_value());
+}
+
+static void test_satisfying_update_releases_lane_when_no_opposite_mode_is_pending()
+{
+    ConnectionParamsUpdateController controller;
+    controller.onConnected(4);
+    TEST_ASSERT_TRUE(controller.request(controller.currentGeneration(), ConnectionParamsMode::HIGH_THROUGHPUT));
+    TEST_ASSERT_TRUE(serviceAt(controller, 100).has_value());
+
+    controller.recordUpdate(4, ConnectionParamsUpdateController::HIGH_THROUGHPUT_MAX_INTERVAL, 0);
+    TEST_ASSERT_FALSE(serviceAt(controller, 101).has_value());
+}
+
+static void test_satisfying_callback_does_not_release_opposite_pending_mode()
+{
+    ConnectionParamsUpdateController controller;
+    controller.onConnected(4);
+    TEST_ASSERT_TRUE(controller.request(controller.currentGeneration(), ConnectionParamsMode::HIGH_THROUGHPUT));
+    TEST_ASSERT_TRUE(serviceAt(controller, 100).has_value());
+    TEST_ASSERT_TRUE(controller.request(controller.currentGeneration(), ConnectionParamsMode::LOW_POWER));
+
+    controller.recordUpdate(4, ConnectionParamsUpdateController::HIGH_THROUGHPUT_MAX_INTERVAL, 0);
+    int32_t delay = 0;
+    TEST_ASSERT_FALSE(serviceAt(controller, 200, true, &delay).has_value());
+    TEST_ASSERT_EQUAL_INT32(ConnectionParamsUpdateController::UPDATE_LANE_TIMEOUT_MS - 100, delay);
+
+    const auto lowPower = serviceAt(controller, 100 + ConnectionParamsUpdateController::UPDATE_LANE_TIMEOUT_MS);
+    TEST_ASSERT_TRUE(lowPower.has_value());
+    assertRequest(*lowPower, 4, ConnectionParamsMode::LOW_POWER);
+}
+
+static void test_unmatched_success_does_not_release_active_request()
+{
+    ConnectionParamsUpdateController controller;
+    controller.onConnected(4);
+    TEST_ASSERT_TRUE(controller.request(controller.currentGeneration(), ConnectionParamsMode::LOW_POWER));
+    TEST_ASSERT_TRUE(serviceAt(controller, 100).has_value());
+
+    controller.recordUpdate(4, ConnectionParamsUpdateController::HIGH_THROUGHPUT_MAX_INTERVAL, 0);
+    TEST_ASSERT_FALSE(serviceAt(controller, 200).has_value());
+
+    const auto retry = serviceAt(controller, 100 + ConnectionParamsUpdateController::UPDATE_LANE_TIMEOUT_MS);
+    TEST_ASSERT_TRUE(retry.has_value());
+    assertRequest(*retry, 4, ConnectionParamsMode::LOW_POWER);
+}
+
+static void test_peer_failure_does_not_release_active_request()
+{
+    ConnectionParamsUpdateController controller;
+    controller.onConnected(1);
+    TEST_ASSERT_TRUE(controller.request(controller.currentGeneration(), ConnectionParamsMode::HIGH_THROUGHPUT));
+    TEST_ASSERT_TRUE(serviceAt(controller, 100).has_value());
+
+    controller.recordUpdate(1, 0, 1);
+    TEST_ASSERT_FALSE(serviceAt(controller, 200).has_value());
+
+    const auto retry = serviceAt(controller, 100 + ConnectionParamsUpdateController::UPDATE_LANE_TIMEOUT_MS);
+    TEST_ASSERT_TRUE(retry.has_value());
+    assertRequest(*retry, 1, ConnectionParamsMode::HIGH_THROUGHPUT);
+}
+
+static void test_latest_request_wins_after_lane_timeout()
+{
+    ConnectionParamsUpdateController controller;
+    controller.onConnected(4);
+    TEST_ASSERT_TRUE(controller.request(controller.currentGeneration(), ConnectionParamsMode::HIGH_THROUGHPUT));
+    TEST_ASSERT_TRUE(serviceAt(controller, 100).has_value());
+
+    TEST_ASSERT_TRUE(controller.request(controller.currentGeneration(), ConnectionParamsMode::LOW_POWER));
+    const auto request = serviceAt(controller, 100 + ConnectionParamsUpdateController::UPDATE_LANE_TIMEOUT_MS);
+    TEST_ASSERT_TRUE(request.has_value());
+    assertRequest(*request, 4, ConnectionParamsMode::LOW_POWER);
+}
+
+static void test_latest_mode_already_satisfied_at_timeout_needs_no_submission()
+{
+    ConnectionParamsUpdateController controller;
+    controller.onConnected(4);
+    TEST_ASSERT_TRUE(controller.request(controller.currentGeneration(), ConnectionParamsMode::LOW_POWER));
+    TEST_ASSERT_TRUE(serviceAt(controller, 100).has_value());
 
     TEST_ASSERT_TRUE(controller.request(controller.currentGeneration(), ConnectionParamsMode::HIGH_THROUGHPUT));
-    TEST_ASSERT_TRUE(controller.request(controller.currentGeneration(), ConnectionParamsMode::LOW_POWER));
-    TEST_ASSERT_TRUE(controller.onUpdateComplete(4));
+    controller.recordUpdate(4, ConnectionParamsUpdateController::HIGH_THROUGHPUT_MAX_INTERVAL, 0);
 
-    TEST_ASSERT_TRUE(controller.beginNext(request));
-    assertRequest(request, 4, ConnectionParamsMode::LOW_POWER);
-    TEST_ASSERT_FALSE(controller.onUpdateComplete(4));
+    const auto afterTimeout = serviceAt(controller, 100 + ConnectionParamsUpdateController::UPDATE_LANE_TIMEOUT_MS);
+    TEST_ASSERT_FALSE(afterTimeout.has_value());
 }
 
-static void test_repeating_active_mode_is_coalesced()
+static void test_submission_rejection_retries_same_request_after_backoff()
 {
     ConnectionParamsUpdateController controller;
-    ConnectionParamsRequest request{};
-    controller.onConnected(3);
-    TEST_ASSERT_TRUE(controller.beginNext(request));
-
-    TEST_ASSERT_TRUE(controller.request(controller.currentGeneration(), ConnectionParamsMode::INITIAL_HIGH_THROUGHPUT));
-    TEST_ASSERT_FALSE(controller.onUpdateComplete(3));
-    TEST_ASSERT_FALSE(controller.beginNext(request));
-}
-
-static void test_submission_rejection_retries_same_request()
-{
-    ConnectionParamsUpdateController controller;
-    ConnectionParamsRequest first{};
-    ConnectionParamsRequest retry{};
     controller.onConnected(9);
-    TEST_ASSERT_TRUE(controller.beginNext(first));
+    TEST_ASSERT_TRUE(controller.request(controller.currentGeneration(), ConnectionParamsMode::HIGH_THROUGHPUT));
 
-    TEST_ASSERT_TRUE(controller.onSubmissionRejected(first));
-    TEST_ASSERT_TRUE(controller.beginNext(retry));
-    assertRequest(retry, 9, ConnectionParamsMode::INITIAL_HIGH_THROUGHPUT);
-    TEST_ASSERT_EQUAL_UINT32(first.generation, retry.generation);
+    int32_t delay = 0;
+    const auto first = serviceAt(controller, 100, false, &delay);
+    TEST_ASSERT_TRUE(first.has_value());
+    TEST_ASSERT_EQUAL_INT32(ConnectionParamsUpdateController::SUBMISSION_RETRY_MS, delay);
+
+    const auto retry = serviceAt(controller, 100 + ConnectionParamsUpdateController::SUBMISSION_RETRY_MS);
+    TEST_ASSERT_TRUE(retry.has_value());
+    assertRequest(*retry, 9, ConnectionParamsMode::HIGH_THROUGHPUT);
+    TEST_ASSERT_EQUAL_UINT32(first->generation, retry->generation);
 }
 
-static void test_retired_session_rejects_stale_submission_and_wrong_handle_completion()
+static void test_satisfied_request_preserves_different_pending_mode()
 {
     ConnectionParamsUpdateController controller;
-    ConnectionParamsRequest retired{};
-    ConnectionParamsRequest current{};
     controller.onConnected(1);
-    TEST_ASSERT_TRUE(controller.beginNext(retired));
+    controller.recordUpdate(1, ConnectionParamsUpdateController::LOW_POWER_MIN_INTERVAL, 0);
+
+    TEST_ASSERT_TRUE(controller.request(controller.currentGeneration(), ConnectionParamsMode::HIGH_THROUGHPUT));
+    TEST_ASSERT_FALSE(controller.request(controller.currentGeneration(), ConnectionParamsMode::LOW_POWER));
+
+    const auto pending = serviceAt(controller, 1);
+    TEST_ASSERT_TRUE(pending.has_value());
+    assertRequest(*pending, 1, ConnectionParamsMode::HIGH_THROUGHPUT);
+}
+
+static void test_reset_mid_flight_retires_request()
+{
+    ConnectionParamsUpdateController controller;
+    controller.onConnected(1);
+    TEST_ASSERT_TRUE(controller.request(controller.currentGeneration(), ConnectionParamsMode::HIGH_THROUGHPUT));
+    const auto retired = serviceAt(controller, 100);
+    TEST_ASSERT_TRUE(retired.has_value());
 
     controller.reset();
-    controller.onConnected(1); // ESP32 commonly reuses connection handle zero/one.
-    TEST_ASSERT_TRUE(controller.beginNext(current));
+    controller.recordUpdate(retired->connHandle, ConnectionParamsUpdateController::HIGH_THROUGHPUT_MAX_INTERVAL, 0);
 
-    TEST_ASSERT_FALSE(controller.onSubmissionRejected(retired));
-    TEST_ASSERT_FALSE(controller.onUpdateComplete(2));
-    TEST_ASSERT_FALSE(controller.beginNext(retired));
+    TEST_ASSERT_FALSE(serviceAt(controller, 101).has_value());
+}
 
-    // NimBLE identifies completion callbacks by connection handle. Once the reused handle completes,
-    // it must release the current session rather than resurrecting the retired request.
-    TEST_ASSERT_FALSE(controller.onUpdateComplete(1));
-    TEST_ASSERT_FALSE(controller.beginNext(retired));
+static void test_submission_is_atomic_with_session_retirement()
+{
+    ConnectionParamsUpdateController controller;
+    controller.onConnected(1);
+    TEST_ASSERT_TRUE(controller.request(controller.currentGeneration(), ConnectionParamsMode::HIGH_THROUGHPUT));
+
+    std::atomic<bool> resetStarted{false};
+    std::atomic<bool> resetFinished{false};
+    std::thread resetThread;
+    const int32_t delay = controller.servicePending(100, [&](const ConnectionParamsRequest &) {
+        resetThread = std::thread([&]() {
+            resetStarted = true;
+            controller.reset();
+            resetFinished = true;
+        });
+        while (!resetStarted.load()) {
+            std::this_thread::yield();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        TEST_ASSERT_FALSE(resetFinished.load());
+        return true;
+    });
+
+    TEST_ASSERT_EQUAL_INT32(ConnectionParamsUpdateController::UPDATE_LANE_TIMEOUT_MS, delay);
+    resetThread.join();
+    TEST_ASSERT_TRUE(resetFinished.load());
+    TEST_ASSERT_FALSE(serviceAt(controller, 101).has_value());
 }
 
 static void test_retired_session_request_cannot_target_reconnect()
 {
     ConnectionParamsUpdateController controller;
-    ConnectionParamsRequest request{};
     controller.onConnected(1);
     const uint32_t retiredGeneration = controller.currentGeneration();
 
@@ -102,18 +225,41 @@ static void test_retired_session_request_cannot_target_reconnect()
     controller.onConnected(1);
 
     TEST_ASSERT_FALSE(controller.request(retiredGeneration, ConnectionParamsMode::LOW_POWER));
-    TEST_ASSERT_TRUE(controller.beginNext(request));
-    assertRequest(request, 1, ConnectionParamsMode::INITIAL_HIGH_THROUGHPUT);
+    TEST_ASSERT_FALSE(serviceAt(controller, 0).has_value());
+}
+
+static void test_wrong_handle_update_does_not_change_active_request()
+{
+    ConnectionParamsUpdateController controller;
+    controller.onConnected(1);
+    TEST_ASSERT_TRUE(controller.request(controller.currentGeneration(), ConnectionParamsMode::HIGH_THROUGHPUT));
+    TEST_ASSERT_TRUE(serviceAt(controller, 100).has_value());
+
+    controller.recordUpdate(2, ConnectionParamsUpdateController::HIGH_THROUGHPUT_MAX_INTERVAL, 0);
+    TEST_ASSERT_FALSE(serviceAt(controller, 200).has_value());
+}
+
+static void test_lane_timeout_is_millis_wrap_safe()
+{
+    ConnectionParamsUpdateController controller;
+    controller.onConnected(1);
+    TEST_ASSERT_TRUE(controller.request(controller.currentGeneration(), ConnectionParamsMode::HIGH_THROUGHPUT));
+
+    constexpr uint32_t start = UINT32_MAX - 100;
+    TEST_ASSERT_TRUE(serviceAt(controller, start).has_value());
+    TEST_ASSERT_FALSE(serviceAt(controller, 50).has_value());
+
+    const uint32_t expiry = start + ConnectionParamsUpdateController::UPDATE_LANE_TIMEOUT_MS;
+    TEST_ASSERT_TRUE(serviceAt(controller, expiry).has_value());
 }
 
 static void test_disconnected_controller_ignores_requests()
 {
     ConnectionParamsUpdateController controller;
-    ConnectionParamsRequest request{};
 
     TEST_ASSERT_FALSE(controller.request(controller.currentGeneration(), ConnectionParamsMode::HIGH_THROUGHPUT));
     TEST_ASSERT_FALSE(controller.request(controller.currentGeneration(), ConnectionParamsMode::NONE));
-    TEST_ASSERT_FALSE(controller.beginNext(request));
+    TEST_ASSERT_FALSE(serviceAt(controller, 0).has_value());
 }
 
 void setUp(void) {}
@@ -123,12 +269,21 @@ void setup()
 {
     initializeTestEnvironment();
     UNITY_BEGIN();
-    RUN_TEST(test_connect_queues_initial_profile);
-    RUN_TEST(test_latest_request_wins_while_update_is_active);
-    RUN_TEST(test_repeating_active_mode_is_coalesced);
-    RUN_TEST(test_submission_rejection_retries_same_request);
-    RUN_TEST(test_retired_session_rejects_stale_submission_and_wrong_handle_completion);
+    RUN_TEST(test_connect_waits_for_a_config_profile_request);
+    RUN_TEST(test_peer_high_throughput_update_avoids_redundant_submission);
+    RUN_TEST(test_satisfying_update_releases_lane_when_no_opposite_mode_is_pending);
+    RUN_TEST(test_satisfying_callback_does_not_release_opposite_pending_mode);
+    RUN_TEST(test_unmatched_success_does_not_release_active_request);
+    RUN_TEST(test_peer_failure_does_not_release_active_request);
+    RUN_TEST(test_latest_request_wins_after_lane_timeout);
+    RUN_TEST(test_latest_mode_already_satisfied_at_timeout_needs_no_submission);
+    RUN_TEST(test_submission_rejection_retries_same_request_after_backoff);
+    RUN_TEST(test_satisfied_request_preserves_different_pending_mode);
+    RUN_TEST(test_reset_mid_flight_retires_request);
+    RUN_TEST(test_submission_is_atomic_with_session_retirement);
     RUN_TEST(test_retired_session_request_cannot_target_reconnect);
+    RUN_TEST(test_wrong_handle_update_does_not_change_active_request);
+    RUN_TEST(test_lane_timeout_is_millis_wrap_safe);
     RUN_TEST(test_disconnected_controller_ignores_requests);
     exit(UNITY_END());
 }
