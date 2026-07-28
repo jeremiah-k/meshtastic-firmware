@@ -232,12 +232,12 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
     {
         // Service a deferred advertising restart from onDisconnect, gated on ble_hs_synced() so we
         // never re-enter the GAP API while the host is still mid-reset.
-        if (pendingStartAdvertising) {
+        if (pendingStartAdvertising.exchange(false)) {
             if (checkIsConnected()) {
-                pendingStartAdvertising = false; // a new physical connection beat us to it; nothing to do
                 advertisingRestartController.reset();
             } else if (!ble_hs_synced()) {
                 advertisingRestartController.reset();
+                pendingStartAdvertising = true;
                 return 200; // host still re-syncing after a reset; retry shortly
             } else {
                 const uint32_t nowMs = millis();
@@ -246,15 +246,16 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
                 advertisingRestartController.armIfNeeded(nowMs, kAdvertisingPostDisconnectDelayMs);
                 const uint32_t remainingMs = advertisingRestartController.remainingMs(nowMs);
                 if (remainingMs != 0) {
+                    pendingStartAdvertising = true;
                     return remainingMs;
                 }
 
                 if (nimbleBluetooth && nimbleBluetooth->startAdvertising()) {
-                    pendingStartAdvertising = false;
                     advertisingRestartController.reset();
                 } else {
                     // Measure the retry from the completed attempt, not from the pre-call timestamp above.
                     advertisingRestartController.arm(millis(), kAdvertisingRetryDelayMs);
+                    pendingStartAdvertising = true;
                     return kAdvertisingRetryDelayMs;
                 }
             }
@@ -943,6 +944,10 @@ void NimbleBluetooth::setup()
     // onDisconnect early-returning without clearing the connection handle.
     bleDraining = false;
     isDeInit = false;
+    // setup() begins a fresh advertising lifecycle even if a caller skipped deinit(). Do not let a stale deferred
+    // restart survive into the new NimBLE instance or an early initialization failure.
+    pendingStartAdvertising = false;
+    advertisingRestartController.reset();
 
 #ifdef ARCH_ESP32
     // Runs before BLEDevice::init() reads the bond store, but logs after the "Init" line above so
