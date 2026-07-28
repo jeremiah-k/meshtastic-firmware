@@ -295,17 +295,11 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
   public:
     BluetoothPhoneAPI() : concurrency::OSThread("NimbleBluetooth") { api_type = TYPE_BLE; }
 
-    void onBleConnected(uint16_t connHandle)
-    {
-        connectionParamsController.onConnected(connHandle);
-        wakeForConnectionParams();
-    }
+    void onBleConnected(uint16_t connHandle) { connectionParamsController.onConnected(connHandle); }
 
-    void onConnectionParamsUpdate(uint16_t connHandle)
+    void onConnectionParamsUpdate(uint16_t connHandle, uint16_t interval, uint8_t status)
     {
-        if (connectionParamsController.onUpdateComplete(connHandle)) {
-            wakeForConnectionParams();
-        }
+        connectionParamsController.recordUpdate(connHandle, interval, status);
     }
 
     void resetConnectionParams() { connectionParamsController.reset(); }
@@ -603,31 +597,18 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
             return INT32_MAX;
         }
 
-        meshtastic::bluetooth::ConnectionParamsRequest request;
-        if (!connectionParamsController.beginNext(request)) {
-            return INT32_MAX;
-        }
-
-        bool accepted = false;
-        switch (request.mode) {
-        case meshtastic::bluetooth::ConnectionParamsMode::INITIAL_HIGH_THROUGHPUT:
-            LOG_INFO("BLE requestInitialHighThroughputConnection");
-            accepted = bleServer->requestConnParams(request.connHandle, 6, 12, 0, 200);
-            break;
-        case meshtastic::bluetooth::ConnectionParamsMode::HIGH_THROUGHPUT:
-            accepted = requestHighThroughputConnection(request.connHandle);
-            break;
-        case meshtastic::bluetooth::ConnectionParamsMode::LOW_POWER:
-            accepted = requestLowerPowerConnection(request.connHandle);
-            break;
-        case meshtastic::bluetooth::ConnectionParamsMode::NONE:
-            break;
-        }
-
-        if (!accepted && connectionParamsController.onSubmissionRejected(request)) {
-            return 250;
-        }
-        return INT32_MAX;
+        return connectionParamsController.servicePending(millis(),
+                                                         [this](const meshtastic::bluetooth::ConnectionParamsRequest &request) {
+                                                             switch (request.mode) {
+                                                             case meshtastic::bluetooth::ConnectionParamsMode::HIGH_THROUGHPUT:
+                                                                 return requestHighThroughputConnection(request.connHandle);
+                                                             case meshtastic::bluetooth::ConnectionParamsMode::LOW_POWER:
+                                                                 return requestLowerPowerConnection(request.connHandle);
+                                                             case meshtastic::bluetooth::ConnectionParamsMode::NONE:
+                                                                 return false;
+                                                             }
+                                                             return false;
+                                                         });
     }
 
     bool requestHighThroughputConnection(uint16_t conn_handle)
@@ -652,7 +633,10 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
         setup. Not worth adjusting much.
         */
         LOG_INFO("BLE requestHighThroughputConnection");
-        return bleServer->requestConnParams(conn_handle, 6, 12, 0, 600);
+        return bleServer->requestConnParams(conn_handle, ConnectionParamsUpdateController::HIGH_THROUGHPUT_MIN_INTERVAL,
+                                            ConnectionParamsUpdateController::HIGH_THROUGHPUT_MAX_INTERVAL,
+                                            ConnectionParamsUpdateController::HIGH_THROUGHPUT_LATENCY,
+                                            ConnectionParamsUpdateController::SUPERVISION_TIMEOUT);
     }
 
     bool requestLowerPowerConnection(uint16_t conn_handle)
@@ -675,7 +659,10 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
         per second.
         */
         LOG_INFO("BLE requestLowerPowerConnection");
-        return bleServer->requestConnParams(conn_handle, 24, 40, 2, 600);
+        return bleServer->requestConnParams(conn_handle, ConnectionParamsUpdateController::LOW_POWER_MIN_INTERVAL,
+                                            ConnectionParamsUpdateController::LOW_POWER_MAX_INTERVAL,
+                                            ConnectionParamsUpdateController::LOW_POWER_LATENCY,
+                                            ConnectionParamsUpdateController::SUPERVISION_TIMEOUT);
     }
 };
 
@@ -995,10 +982,10 @@ class NimbleBluetoothServerCallback : public BLEServerCallbacks
         }
     }
 
-    void onConnParamsUpdate(uint16_t connHandle, uint16_t, uint16_t, uint16_t, uint8_t) override
+    void onConnParamsUpdate(uint16_t connHandle, uint16_t interval, uint16_t, uint16_t, uint8_t status) override
     {
         if (bluetoothPhoneAPI) {
-            bluetoothPhoneAPI->onConnectionParamsUpdate(connHandle);
+            bluetoothPhoneAPI->onConnectionParamsUpdate(connHandle, interval, status);
         }
     }
 
