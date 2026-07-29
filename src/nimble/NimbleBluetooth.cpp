@@ -19,6 +19,7 @@
 #include <atomic>
 #include <mutex>
 
+#include "BleLogPolicy.h"
 #include "PowerStatus.h"
 
 #include "host/ble_gap.h"
@@ -31,9 +32,15 @@
 
 namespace
 {
-constexpr uint16_t kPreferredBleMtu = 517;
 constexpr uint16_t kPreferredBleTxOctets = 251;
 constexpr uint16_t kPreferredBleTxTimeUs = (kPreferredBleTxOctets + 14) * 8;
+#if defined(CONFIG_IDF_TARGET_ESP32)
+// Keep each ATT packet within one data-length payload on the original ESP32 controller.
+constexpr uint16_t kPreferredBleMtu = kPreferredBleTxOctets - 4; // L2CAP header
+constexpr uint32_t kLogNotifyMinIntervalMs = 25;
+#else
+constexpr uint16_t kPreferredBleMtu = 517;
+#endif
 } // namespace
 
 #ifdef ARCH_ESP32
@@ -641,14 +648,22 @@ class NimbleBluetoothFromRadioCallback : public BLECharacteristicCallbacks
 // responses, so a logging burst starves them; back off on rejection until the pool refills.
 static constexpr uint32_t LOG_NOTIFY_BACKOFF_MS = 250;
 static std::atomic<uint32_t> lastLogNotifyFailureMs{0};
+static std::atomic<bool> hasLogNotifyFailure{false};
+#if defined(CONFIG_IDF_TARGET_ESP32)
+static std::atomic_flag logNotifyAdmission = ATOMIC_FLAG_INIT;
+static uint32_t lastLogNotifyMs = 0;
+static bool hasLogNotify = false;
+#endif
 
 class NimbleBluetoothLogRadioCallback : public BLECharacteristicCallbacks
 {
     void onStatus(BLECharacteristic *, Status s, uint32_t) override
     {
         // ERROR_GATT is the only status meaning the host refused it; the rest never allocated.
-        if (s == Status::ERROR_GATT)
+        if (s == Status::ERROR_GATT) {
             lastLogNotifyFailureMs.store(millis());
+            hasLogNotifyFailure = true;
+        }
     }
 };
 
@@ -932,32 +947,35 @@ void NimbleBluetooth::setup()
         LOG_WARN("Unable to request MTU %u, rc=%d", kPreferredBleMtu, mtuResult);
     }
 
-    // BLESecurity only forwards to static NimBLEDevice setters; a stack instance suffices.
-    BLESecurity security;
-    security.setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
-    security.setRespEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+    BLESecurity::setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+    BLESecurity::setRespEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
     if (config.bluetooth.mode != meshtastic_Config_BluetoothConfig_PairingMode_NO_PIN) {
         // Set IO capability to DisplayOnly for MITM authentication
-        security.setCapability(ESP_IO_CAP_OUT);
+        BLESecurity::setCapability(ESP_IO_CAP_OUT);
         // Set the passkey
         if (config.bluetooth.mode == meshtastic_Config_BluetoothConfig_PairingMode_RANDOM_PIN) {
             LOG_INFO("Use random passkey");
-            security.setPassKey(false); // generate a random passkey
+            BLESecurity::setPassKey(false); // generate a random passkey
         } else {
             LOG_INFO("Use fixed passkey");
-            security.setPassKey(true, config.bluetooth.fixed_pin);
+            BLESecurity::setPassKey(true, config.bluetooth.fixed_pin);
         }
         // Enable authorization requirements:
         // - bonding: true (for persistent storage of the keys)
         // - MITM: true (enables Man-In-The-Middle protection for password prompts)
         // - secure connection: true (enables secure connection for encryption)
-        security.setAuthenticationMode(true, true, true);
+        BLESecurity::setAuthenticationMode(true, true, true);
     } else {
         // No IO capability for no PIN mode
-        security.setCapability(ESP_IO_CAP_NONE);
+        BLESecurity::setCapability(ESP_IO_CAP_NONE);
         // No PIN mode: no MITM protection
-        security.setAuthenticationMode(true, false, false);
+        BLESecurity::setAuthenticationMode(true, false, false);
     }
+#if defined(CONFIG_IDF_TARGET_ESP32)
+    // Android initiates PIN bonding; avoid concurrent peripheral SMP on the original ESP32.
+    // NO_PIN characteristics are unprotected, so retain connect-time bonding for that mode.
+    BLESecurity::setForceAuthentication(config.bluetooth.mode == meshtastic_Config_BluetoothConfig_PairingMode_NO_PIN);
+#endif
     // Statics: setup() re-runs on BLE re-enable, and the library never frees these
     // caller-owned callback objects, so register the same instances every cycle.
     static NimbleBluetoothSecurityCallback securityCallbacks;
@@ -1071,14 +1089,38 @@ void NimbleBluetooth::clearBonds()
 
 void NimbleBluetooth::sendLog(const uint8_t *logMessage, size_t length)
 {
-    if (!isConnected() || length > 512) {
+    const uint16_t connHandle = nimbleBluetoothConnHandle.load();
+    if (connHandle == BLE_HS_CONN_HANDLE_NONE || !bleServer || !logRadioCharacteristic) {
         return;
     }
-    if (!logRadioCharacteristic) // BLE may have been torn down; never notify a freed characteristic
+
+    const uint16_t peerMtu = bleServer->getPeerMTU(connHandle);
+    if (!meshtastic::bluetooth::BleLogPolicy::fitsPeerMtu(length, peerMtu)) {
         return;
+    }
+
+    const uint32_t nowMs = millis();
     // Pool still under pressure; drop this line rather than spend a buffer fromNum needs.
-    if (Throttle::isWithinTimespanMs(lastLogNotifyFailureMs.load(), LOG_NOTIFY_BACKOFF_MS))
+    if (!meshtastic::bluetooth::BleLogPolicy::intervalElapsed(hasLogNotifyFailure.load(), lastLogNotifyFailureMs.load(),
+                                                              LOG_NOTIFY_BACKOFF_MS, nowMs)) {
         return;
+    }
+#if defined(CONFIG_IDF_TARGET_ESP32)
+    // Debug logs are best effort. Bound bursts to 40 notifications per second on the legacy controller.
+    if (logNotifyAdmission.test_and_set()) {
+        return;
+    }
+    const bool intervalElapsed =
+        meshtastic::bluetooth::BleLogPolicy::intervalElapsed(hasLogNotify, lastLogNotifyMs, kLogNotifyMinIntervalMs, nowMs);
+    if (intervalElapsed) {
+        lastLogNotifyMs = nowMs;
+        hasLogNotify = true;
+    }
+    logNotifyAdmission.clear();
+    if (!intervalElapsed) {
+        return;
+    }
+#endif
     logRadioCharacteristic->setValue(logMessage, length);
     logRadioCharacteristic->notify();
 }
