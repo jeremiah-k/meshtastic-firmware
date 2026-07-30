@@ -4,6 +4,13 @@
 #include <unity.h>
 
 using meshtastic::bluetooth::AdvertisingRestartController;
+using meshtastic::bluetooth::shouldRebootClassicEsp32AfterDisconnect;
+
+static void test_disconnect_recovery_reboots_only_authenticated_classic_esp32()
+{
+    TEST_ASSERT_TRUE(shouldRebootClassicEsp32AfterDisconnect(true));
+    TEST_ASSERT_FALSE(shouldRebootClassicEsp32AfterDisconnect(false));
+}
 
 static void test_unarmed_controller_is_ready()
 {
@@ -75,6 +82,7 @@ void setup()
 {
     initializeTestEnvironment();
     UNITY_BEGIN();
+    RUN_TEST(test_disconnect_recovery_reboots_only_authenticated_classic_esp32);
     RUN_TEST(test_unarmed_controller_is_ready);
     RUN_TEST(test_arm_waits_then_becomes_ready);
     RUN_TEST(test_arm_if_needed_arms_an_unarmed_controller);

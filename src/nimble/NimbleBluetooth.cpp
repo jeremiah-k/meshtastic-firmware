@@ -41,6 +41,9 @@ namespace
 {
 constexpr uint32_t kAdvertisingPostDisconnectDelayMs = 250;
 constexpr uint32_t kAdvertisingRetryDelayMs = 1000;
+#if defined(CONFIG_IDF_TARGET_ESP32)
+constexpr uint32_t kClassicEsp32RecoveryRebootDelayMs = 100;
+#endif
 } // namespace
 
 #ifdef ARCH_ESP32
@@ -114,9 +117,27 @@ static std::atomic<uint16_t> nimbleBluetoothConnHandle{BLE_HS_CONN_HANDLE_NONE};
 // triggers a MIC failure + NimBLE host reset; re-entering ble_gap_adv_* from the disconnect
 // callback while the host is mid-reset crashes (LoadProhibited), so the main task does it instead.
 static std::atomic<bool> pendingStartAdvertising{false};
+#if defined(CONFIG_IDF_TARGET_ESP32)
+// Authenticated sessions on original ESP32 require a reboot to reset the closed controller reliably.
+static std::atomic<bool> pendingClassicEsp32RecoveryReboot{false};
+#endif
 // Timing is owned exclusively by BluetoothPhoneAPI::runOnce on the main task; the NimBLE callback only raises the
 // atomic pending flag. Keeping the timer out of the callback avoids another cross-task synchronization surface.
 static meshtastic::bluetooth::AdvertisingRestartController advertisingRestartController;
+
+static inline bool hasPhysicalBleConnection()
+{
+    return bleServer && bleServer->getConnectedCount() != 0;
+}
+
+static inline void clearAdvertisingRecoveryState()
+{
+    pendingStartAdvertising = false;
+#if defined(CONFIG_IDF_TARGET_ESP32)
+    pendingClassicEsp32RecoveryReboot = false;
+#endif
+    advertisingRestartController.reset();
+}
 
 // Set by deinit() before it disconnects. Makes onRead bail immediately instead of arming the
 // up-to-20s wait, so a read arriving mid-teardown can't pin the NimBLE task and stall the disconnect.
@@ -231,23 +252,35 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
     virtual int32_t runOnce() override
     {
         // Service a deferred advertising restart from onDisconnect, gated on ble_hs_synced() so we
-        // never re-enter the GAP API while the host is still mid-reset.
+        // never re-enter the GAP API while the host is still mid-reset. Authenticated classic ESP32 sessions reboot first.
         if (pendingStartAdvertising.exchange(false)) {
-            if (checkIsConnected()) {
-                advertisingRestartController.reset();
-            } else if (!ble_hs_synced()) {
-                advertisingRestartController.reset();
-                pendingStartAdvertising = true;
-                return 200; // host still re-syncing after a reset; retry shortly
+            if (hasPhysicalBleConnection()) {
+                clearAdvertisingRecoveryState();
             } else {
                 const uint32_t nowMs = millis();
-                // The disconnect callback can arrive before the controller has fully retired its ACL state. Give that
-                // state a short quiet period before re-entering advertising, then retain failed starts for retry.
+                // Give the controller a short quiet period to retire the old ACL state before recovery.
                 advertisingRestartController.armIfNeeded(nowMs, kAdvertisingPostDisconnectDelayMs);
                 const uint32_t remainingMs = advertisingRestartController.remainingMs(nowMs);
                 if (remainingMs != 0) {
                     pendingStartAdvertising = true;
                     return remainingMs;
+                }
+
+#if defined(CONFIG_IDF_TARGET_ESP32)
+                if (pendingClassicEsp32RecoveryReboot.exchange(false)) {
+                    clearAdvertisingRecoveryState();
+                    if (rebootAtMsec == 0) {
+                        LOG_WARN("Rebooting classic ESP32 to recover BLE after disconnect");
+                        rebootAtMsec = millis() + kClassicEsp32RecoveryRebootDelayMs;
+                    }
+                    return kClassicEsp32RecoveryRebootDelayMs;
+                }
+#endif
+
+                if (!ble_hs_synced()) {
+                    advertisingRestartController.reset();
+                    pendingStartAdvertising = true;
+                    return 200; // host still re-syncing after a reset; retry shortly
                 }
 
                 if (nimbleBluetooth && nimbleBluetooth->startAdvertising()) {
@@ -808,10 +841,18 @@ class NimbleBluetoothServerCallback : public BLEServerCallbacks
         bluetoothStatus->updateStatus(&newStatus);
         clearPairingDisplay();
 
+#if defined(CONFIG_IDF_TARGET_ESP32)
+        const bool authenticatedSession = nimbleBluetoothConnHandle.load() != BLE_HS_CONN_HANDLE_NONE;
+#endif
         resetBleSessionState();
 
-        // Defer the advertising restart to runOnce (see pendingStartAdvertising): calling
-        // startAdvertising() here would crash if this disconnect was a host reset.
+        // Failed authentication can retry advertising in place. Authenticated original-ESP32 sessions need a full
+        // controller reset, but deferring that reboot to runOnce keeps the callback short and avoids stale-bond loops.
+#if defined(CONFIG_IDF_TARGET_ESP32)
+        if (meshtastic::bluetooth::shouldRebootClassicEsp32AfterDisconnect(authenticatedSession)) {
+            pendingClassicEsp32RecoveryReboot = true;
+        }
+#endif
         pendingStartAdvertising = true;
         if (bluetoothPhoneAPI) {
             bluetoothPhoneAPI->setIntervalFromNow(0);
@@ -881,8 +922,7 @@ void NimbleBluetooth::deinit()
     }
 
     isDeInit = true;
-    pendingStartAdvertising = false; // stack is going away; don't let runOnce retry the adv restart
-    advertisingRestartController.reset();
+    clearAdvertisingRecoveryState(); // stack is going away; don't let runOnce retry advertising recovery
 
 #ifdef BLE_LED
     digitalWrite(BLE_LED, LED_STATE_OFF);
@@ -944,10 +984,8 @@ void NimbleBluetooth::setup()
     // onDisconnect early-returning without clearing the connection handle.
     bleDraining = false;
     isDeInit = false;
-    // setup() begins a fresh advertising lifecycle even if a caller skipped deinit(). Do not let a stale deferred
-    // restart survive into the new NimBLE instance or an early initialization failure.
-    pendingStartAdvertising = false;
-    advertisingRestartController.reset();
+    // A fresh NimBLE instance must not inherit deferred recovery from the previous stack.
+    clearAdvertisingRecoveryState();
 
 #ifdef ARCH_ESP32
     // Runs before BLEDevice::init() reads the bond store, but logs after the "Init" line above so

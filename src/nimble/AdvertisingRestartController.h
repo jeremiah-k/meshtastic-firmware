@@ -7,6 +7,11 @@
 namespace meshtastic::bluetooth
 {
 
+constexpr bool shouldRebootClassicEsp32AfterDisconnect(bool authenticatedSession)
+{
+    return authenticatedSession;
+}
+
 /**
  * Main-task timing state for a deferred BLE advertising restart.
  *
