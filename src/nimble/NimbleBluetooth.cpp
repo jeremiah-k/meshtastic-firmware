@@ -22,6 +22,7 @@
 
 #include "PowerStatus.h"
 
+#include "BleResourceGate.h"
 #include "host/ble_gap.h"
 #include "host/ble_hs.h"
 #include "host/ble_store.h"
@@ -126,6 +127,7 @@ namespace
 {
 constexpr uint8_t kNimbleInitRetryLimit = 3;
 constexpr uint32_t kNimbleInitRetryBaseDelayMs = 1000;
+constexpr uint32_t kBleResourceDrainTimeoutMs = 2000;
 bool pendingNimbleInitRetry = false;
 uint8_t nimbleInitRetryCount = 0;
 uint32_t nimbleInitRetryStartedAtMs = 0;
@@ -166,9 +168,9 @@ static std::atomic<uint16_t> nimbleBluetoothConnHandle{BLE_HS_CONN_HANDLE_NONE};
 // callback while the host is mid-reset crashes (LoadProhibited), so the main task does it instead.
 static std::atomic<bool> pendingStartAdvertising{false};
 
-// Set by deinit() before it disconnects. Makes onRead bail immediately instead of arming the
-// up-to-20s wait, so a read arriving mid-teardown can't pin the NimBLE task and stall the disconnect.
-static std::atomic<bool> bleDraining{false};
+// Set to draining before disconnect. This releases an in-flight onRead wait, rejects new characteristic access, and lets
+// deinit() wait until any notifier that already acquired a resource has finished.
+static meshtastic::bluetooth::BleResourceGate bleResourceGate;
 
 static void clearPairingDisplay()
 {
@@ -286,7 +288,11 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
             }
 
             pendingNimbleInitRetry = false;
-            nimbleBluetooth->setupInternal(true);
+            if (nimbleBluetooth) {
+                nimbleBluetooth->setupInternal(true);
+            } else {
+                resetNimbleInitRetry();
+            }
             if (pendingNimbleInitRetry) {
                 return Throttle::remainingTimespanMs(nimbleInitRetryStartedAtMs, nimbleInitRetryDelayMs(nimbleInitRetryCount),
                                                      millis());
@@ -472,6 +478,11 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
     {
         PhoneAPI::onNowHasData(fromRadioNum);
 
+        meshtastic::bluetooth::BleResourceLease lease(bleResourceGate);
+        if (!lease) {
+            return;
+        }
+
 #ifdef DEBUG_NIMBLE_NOTIFY
         int currentNotifyCount = notifyCount.fetch_add(1);
         uint8_t cc = bleServer->getConnectedCount();
@@ -482,10 +493,10 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
         uint8_t val[4];
         put_le32(val, fromRadioNum);
 
-        if (!fromNumCharacteristic) // BLE may have been torn down; never notify a freed characteristic
-            return;
-        fromNumCharacteristic->setValue(val, sizeof(val));
-        fromNumCharacteristic->notify();
+        if (fromNumCharacteristic) {
+            fromNumCharacteristic->setValue(val, sizeof(val));
+            fromNumCharacteristic->notify();
+        }
     }
 
     /// Check the current underlying physical link to see if the client is currently connected
@@ -621,7 +632,7 @@ class NimbleBluetoothFromRadioCallback : public BLECharacteristicCallbacks
 #ifdef DEBUG_NIMBLE_ON_READ_TIMING
             LOG_DEBUG("BLE onRead(%d): packet already waiting, no need to set onReadCallbackIsWaitingForData", currentReadCount);
 #endif
-        } else if (!bleDraining) {
+        } else if (!bleResourceGate.isDraining()) {
             // (If deinit() is tearing the stack down, skip the wait entirely and just return a 0-size
             // response below - arming the wait here could pin this NimBLE task for ~20s and stall teardown.)
 
@@ -631,8 +642,8 @@ class NimbleBluetoothFromRadioCallback : public BLECharacteristicCallbacks
             // Wait for the main task to produce a packet for us, up to about 20 seconds.
             // It normally takes just a few milliseconds, but at initial startup, etc, the main task can get blocked for longer
             // doing various setup tasks.
-            // bleDraining lets deinit() release an in-flight wait immediately.
-            while (bluetoothPhoneAPI->onReadCallbackIsWaitingForData && !bleDraining && tries < 4000) {
+            // The resource gate lets deinit() release an in-flight wait immediately.
+            while (bluetoothPhoneAPI->onReadCallbackIsWaitingForData && !bleResourceGate.isDraining() && tries < 4000) {
                 // Schedule the main task runOnce to run ASAP.
                 bluetoothPhoneAPI->setIntervalFromNow(0);
                 concurrency::mainDelay.interrupt(); // wake up main loop if sleeping
@@ -910,9 +921,9 @@ void NimbleBluetooth::deinit()
     // BLEDevice::deinit() deletes the BLEServer before nimble_port_stop(); doing that with a live
     // connection dispatches synthesized unsubscribe events into the freed server (LoadProhibited),
     // so disconnect cleanly first. deinit() runs on the main task; the waits below are bounded.
-    // bleDraining must be set before we clear the flag / disconnect, so a read arriving now bails
+    // Draining must begin before we clear the flag / disconnect, so a read arriving now bails
     // instead of re-arming the ~20s wait and re-pinning the NimBLE task through the whole teardown.
-    bleDraining = true;
+    bleResourceGate.beginDrain();
     if (bluetoothPhoneAPI)
         bluetoothPhoneAPI->onReadCallbackIsWaitingForData = false; // release any in-flight onRead
 
@@ -928,6 +939,19 @@ void NimbleBluetooth::deinit()
 
     isDeInit = true;
     pendingStartAdvertising = false; // stack is going away; don't let runOnce retry the adv restart
+
+    // Null checks alone are insufficient across tasks: a notifier may already hold one of the pointers below. Wait until
+    // all admitted users finish before BLEDevice::deinit() frees their backing objects.
+    const uint32_t resourceDrainStartedAtMs = millis();
+    while (bleResourceGate.hasActiveUsers() &&
+           Throttle::isWithinTimespanMs(resourceDrainStartedAtMs, kBleResourceDrainTimeoutMs)) {
+        delay(1);
+    }
+    if (bleResourceGate.hasActiveUsers()) {
+        LOG_ERROR("BLE resource access did not drain; rebooting instead of freeing live objects");
+        ESP.restart();
+        return;
+    }
 
 #ifdef BLE_LED
     digitalWrite(BLE_LED, LED_STATE_OFF);
@@ -994,7 +1018,7 @@ void NimbleBluetooth::setupInternal(bool isRetry)
     }
 
     // Clear teardown guards so same-boot reinitialization cannot leave reads draining or disconnect cleanup bypassed.
-    bleDraining = false;
+    bleResourceGate.reopen();
     isDeInit = false;
 
 #ifdef ARCH_ESP32
@@ -1004,7 +1028,7 @@ void NimbleBluetooth::setupInternal(bool isRetry)
 #endif
 
     if (!BLEDevice::init(getDeviceName())) {
-        bleDraining = true;
+        bleResourceGate.beginDrain();
         isDeInit = true;
         pendingStartAdvertising = false;
         bleServer = nullptr;
@@ -1158,19 +1182,29 @@ void NimbleBluetooth::setupService()
 /// Given a level between 0-100, update the BLE attribute
 void updateBatteryLevel(uint8_t level)
 {
-    if (!config.bluetooth.enabled || !BatteryCharacteristic)
+    if (!config.bluetooth.enabled) {
         return;
+    }
 
-    if (level > 100) // 0x2A19 must stay within the BAS 0-100 range
-        level = 100;
-    if (level == lastBatteryLevel)
+    meshtastic::bluetooth::BleResourceLease lease(bleResourceGate);
+    if (!lease) {
         return;
-    lastBatteryLevel = level;
+    }
 
-    // Cache the value so a READ works without a subscriber; notify only when connected.
-    BatteryCharacteristic->setValue(&level, 1);
-    if (nimbleBluetooth && nimbleBluetooth->isConnected())
-        BatteryCharacteristic->notify();
+    if (BatteryCharacteristic) {
+        if (level > 100) { // 0x2A19 must stay within the BAS 0-100 range
+            level = 100;
+        }
+        if (level != lastBatteryLevel) {
+            lastBatteryLevel = level;
+
+            // Cache the value so a READ works without a subscriber; notify only when connected.
+            BatteryCharacteristic->setValue(&level, 1);
+            if (nimbleBluetooth && nimbleBluetooth->isConnected()) {
+                BatteryCharacteristic->notify();
+            }
+        }
+    }
 }
 
 void NimbleBluetooth::clearBonds()
@@ -1183,15 +1217,15 @@ void NimbleBluetooth::clearBonds()
 
 void NimbleBluetooth::sendLog(const uint8_t *logMessage, size_t length)
 {
-    if (!isConnected() || length > 512) {
+    meshtastic::bluetooth::BleResourceLease lease(bleResourceGate);
+    if (!lease) {
         return;
     }
-    if (!logRadioCharacteristic) // BLE may have been torn down; never notify a freed characteristic
-        return;
-    // Pool still under pressure; drop this line rather than spend a buffer fromNum needs.
-    if (Throttle::isWithinTimespanMs(lastLogNotifyFailureMs.load(), LOG_NOTIFY_BACKOFF_MS))
-        return;
-    logRadioCharacteristic->setValue(logMessage, length);
-    logRadioCharacteristic->notify();
+
+    if (isConnected() && length <= 512 && logRadioCharacteristic &&
+        !Throttle::isWithinTimespanMs(lastLogNotifyFailureMs.load(), LOG_NOTIFY_BACKOFF_MS)) {
+        logRadioCharacteristic->setValue(logMessage, length);
+        logRadioCharacteristic->notify();
+    }
 }
 #endif
