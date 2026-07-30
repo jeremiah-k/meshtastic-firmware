@@ -602,6 +602,36 @@ void RadioLibInterface::completeSending()
     }
 }
 
+void RadioLibInterface::discardSending()
+{
+    auto *packet = sendingPacket;
+    sendingPacket = nullptr;
+#ifdef LED_LORA
+    digitalWrite(LED_LORA, LED_STATE_OFF);
+#endif
+    if (!packet) {
+        return;
+    }
+
+    printPacket("Discarding failed send", packet);
+#if !MESHTASTIC_EXCLUDE_BEACON
+    MeshBeaconModule::clearTargetRadioSettings(packet);
+#endif
+    packetPool.release(packet);
+    txDrop++;
+}
+
+void RadioLibInterface::discardPendingTx()
+{
+    while (auto *packet = txQueue.dequeue()) {
+#if !MESHTASTIC_EXCLUDE_BEACON
+        MeshBeaconModule::clearTargetRadioSettings(packet);
+#endif
+        packetPool.release(packet);
+        txDrop++;
+    }
+}
+
 void RadioLibInterface::handleReceiveInterrupt()
 {
     // when this is called, we should be in receive mode - if we are not, just jump out instead of bombing. Possible Race

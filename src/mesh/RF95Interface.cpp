@@ -212,6 +212,8 @@ bool RF95Interface::reconfigure()
 
     // set mode to standby
     setStandby();
+    if (disabled)
+        return false;
 
     // configure publicly accessible settings
     int err = lora->setSpreadingFactor(sf);
@@ -273,14 +275,34 @@ void RF95Interface::addReceiveMetadata(meshtastic_MeshPacket *mp)
 
 void RF95Interface::setStandby()
 {
+    if (disabled) {
+        isReceiving = false;
+        disableInterrupt();
+        discardSending();
+        discardPendingTx();
+        RadioLibInterface::setStandby();
+        return;
+    }
+
     int err = lora->standby();
-    if (err != RADIOLIB_ERR_NONE)
-        LOG_ERROR("RF95 standby %s%d", radioLibErr, err);
-    assert(err == RADIOLIB_ERR_NONE);
+    if (err == RADIOLIB_ERR_SPI_WRITE_FAILED) {
+        LOG_DEBUG("RF95 standby %s%d; retrying", radioLibErr, err);
+        delay(10);
+        err = lora->standby();
+    }
 
     isReceiving = false; // If we were receiving, not any more
     disableInterrupt();
-    completeSending(); // If we were sending, not anymore
+    if (err != RADIOLIB_ERR_NONE) {
+        LOG_ERROR("RF95 standby %s%d; disabling radio", radioLibErr, err);
+        RECORD_CRITICALERROR(meshtastic_CriticalErrorCode_RADIO_SPI_BUG);
+        disabled = true;
+        setTransmitEnable(false);
+        discardSending();
+        discardPendingTx();
+    } else {
+        completeSending();
+    }
     RadioLibInterface::setStandby();
 }
 
@@ -297,6 +319,9 @@ void RF95Interface::startReceive()
 {
     setTransmitEnable(false);
     setStandby();
+    if (disabled)
+        return;
+
     int err = lora->startReceive();
     if (err != RADIOLIB_ERR_NONE)
         LOG_ERROR("RF95 startReceive %s%d", radioLibErr, err);
@@ -315,6 +340,9 @@ bool RF95Interface::isChannelActive()
     int16_t result;
     setTransmitEnable(false);
     setStandby(); // needed for smooth transition
+    if (disabled)
+        return true; // Keep the scheduler from submitting work to a failed radio.
+
     result = lora->scanChannel();
 
     if (result == RADIOLIB_PREAMBLE_DETECTED) {
@@ -339,7 +367,8 @@ bool RF95Interface::sleep()
 {
     // put chipset into sleep mode
     setStandby(); // First cancel any active receiving/sending
-    lora->sleep();
+    if (!disabled)
+        lora->sleep();
 
 #ifdef RF95_POWER_EN
     digitalWrite(RF95_POWER_EN, LOW);

@@ -295,6 +295,12 @@ class RadioLibInterface : public RadioInterface, protected concurrency::Notified
      * If a send was in progress finish it and return the buffer to the pool */
     void completeSending();
 
+    /** Release an in-flight packet that cannot be confirmed as transmitted. */
+    void discardSending();
+
+    /** Release packets that cannot be transmitted after a permanent radio failure. */
+    void discardPendingTx();
+
     /**
      * Add SNR data to received messages
      */
