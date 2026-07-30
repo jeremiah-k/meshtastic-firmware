@@ -212,8 +212,9 @@ bool RF95Interface::reconfigure()
 
     // set mode to standby
     setStandby();
-    if (disabled)
+    if (disabled) {
         return false;
+    }
 
     // configure publicly accessible settings
     int err = lora->setSpreadingFactor(sf);
@@ -319,8 +320,9 @@ void RF95Interface::startReceive()
 {
     setTransmitEnable(false);
     setStandby();
-    if (disabled)
+    if (disabled) {
         return;
+    }
 
     int err = lora->startReceive();
     if (err != RADIOLIB_ERR_NONE)
@@ -340,8 +342,9 @@ bool RF95Interface::isChannelActive()
     int16_t result;
     setTransmitEnable(false);
     setStandby(); // needed for smooth transition
-    if (disabled)
+    if (disabled) {
         return true; // Keep the scheduler from submitting work to a failed radio.
+    }
 
     result = lora->scanChannel();
 
@@ -367,8 +370,9 @@ bool RF95Interface::sleep()
 {
     // put chipset into sleep mode
     setStandby(); // First cancel any active receiving/sending
-    if (!disabled)
+    if (!disabled) {
         lora->sleep();
+    }
 
 #ifdef RF95_POWER_EN
     digitalWrite(RF95_POWER_EN, LOW);
