@@ -1261,8 +1261,9 @@ bool AdminModule::handleSetModuleConfig(const meshtastic_ModuleConfig &c)
         if (!MQTT::isValidConfig(c.payload_variant.mqtt)) {
             return false;
         }
-        // Disable Bluetooth to prevent interference during MQTT configuration
-        disableBluetooth();
+        // A transaction still needs this transport for the remaining writes and commit.
+        if (!hasOpenEditTransaction)
+            disableBluetooth();
         moduleConfig.has_mqtt = true;
         {
             char prevPass[sizeof(moduleConfig.mqtt.password)];
@@ -1280,7 +1281,8 @@ bool AdminModule::handleSetModuleConfig(const meshtastic_ModuleConfig &c)
             LOG_ERROR("Invalid serial config");
             return false;
         }
-        disableBluetooth(); // Disable Bluetooth to prevent interference during Serial configuration
+        if (!hasOpenEditTransaction)
+            disableBluetooth(); // Prevent interference during standalone Serial configuration.
         moduleConfig.has_serial = true;
         moduleConfig.serial = c.payload_variant.serial;
         break;

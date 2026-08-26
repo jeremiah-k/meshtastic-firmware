@@ -2284,7 +2284,7 @@ static void assertRoutingSuccessReply(uint32_t requestId)
     TEST_ASSERT_EQUAL(meshtastic_Routing_Error_NONE, routing.error_reason);
 }
 
-static meshtastic_ModuleConfig makeCommitResponseMqttModuleConfig()
+static meshtastic_ModuleConfig makeMqttModuleConfig()
 {
     meshtastic_ModuleConfig config = meshtastic_ModuleConfig_init_zero;
     config.which_payload_variant = meshtastic_ModuleConfig_mqtt_tag;
@@ -2292,10 +2292,50 @@ static meshtastic_ModuleConfig makeCommitResponseMqttModuleConfig()
     return config;
 }
 
+static meshtastic_ModuleConfig makeSerialModuleConfig()
+{
+    meshtastic_ModuleConfig config = meshtastic_ModuleConfig_init_zero;
+    config.which_payload_variant = meshtastic_ModuleConfig_serial_tag;
+    config.payload_variant.serial = meshtastic_ModuleConfig_SerialConfig_init_zero;
+    return config;
+}
+
+static void test_mqttConfig_standaloneDisablesBluetooth()
+{
+    resetDisableBluetoothCallCountForTest();
+    TEST_ASSERT_TRUE(testAdmin->handleSetModuleConfig(makeMqttModuleConfig()));
+    TEST_ASSERT_EQUAL_UINT32(1, getDisableBluetoothCallCountForTest());
+}
+
+static void test_mqttConfig_transactionPreservesBluetooth()
+{
+    sendBeginEdit();
+    resetDisableBluetoothCallCountForTest();
+    TEST_ASSERT_TRUE(testAdmin->handleSetModuleConfig(makeMqttModuleConfig()));
+    TEST_ASSERT_EQUAL_UINT32(0, getDisableBluetoothCallCountForTest());
+    sendCommitEdit();
+}
+
+static void test_serialConfig_standaloneDisablesBluetooth()
+{
+    resetDisableBluetoothCallCountForTest();
+    TEST_ASSERT_TRUE(testAdmin->handleSetModuleConfig(makeSerialModuleConfig()));
+    TEST_ASSERT_EQUAL_UINT32(1, getDisableBluetoothCallCountForTest());
+}
+
+static void test_serialConfig_transactionPreservesBluetooth()
+{
+    sendBeginEdit();
+    resetDisableBluetoothCallCountForTest();
+    TEST_ASSERT_TRUE(testAdmin->handleSetModuleConfig(makeSerialModuleConfig()));
+    TEST_ASSERT_EQUAL_UINT32(0, getDisableBluetoothCallCountForTest());
+    sendCommitEdit();
+}
+
 static void test_commitResponse_keepsTransportAliveUntilScheduledReboot()
 {
     sendBeginEdit();
-    TEST_ASSERT_TRUE(testAdmin->handleSetModuleConfig(makeCommitResponseMqttModuleConfig()));
+    TEST_ASSERT_TRUE(testAdmin->handleSetModuleConfig(makeMqttModuleConfig()));
     resetDisableBluetoothCallCountForTest();
 
     constexpr uint32_t requestId = 0xC011117;
@@ -2487,6 +2527,10 @@ void setup()
     RUN_TEST(test_editTransaction_active_isNotRetired);
     RUN_TEST(test_warn_license_noTransaction_emittedImmediately);
     RUN_TEST(test_warn_license_transaction_coalescedToSingleMessage);
+    RUN_TEST(test_mqttConfig_standaloneDisablesBluetooth);
+    RUN_TEST(test_mqttConfig_transactionPreservesBluetooth);
+    RUN_TEST(test_serialConfig_standaloneDisablesBluetooth);
+    RUN_TEST(test_serialConfig_transactionPreservesBluetooth);
     RUN_TEST(test_commitResponse_keepsTransportAliveUntilScheduledReboot);
     RUN_TEST(test_restorePreferences_replyPrecedesDefaultRebootAndTransportTeardown);
 
