@@ -438,17 +438,36 @@ bool AdminModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshta
     }
     case meshtastic_AdminMessage_factory_reset_config_tag: {
         LOG_INFO("Initiate factory config reset");
-        // Keep BLE active while reset cleanup performs nRF flash operations.
+#if defined(ARCH_ESP32)
+        // The reset path erases NVS, and NimBLE's bond store (ble_store_config, the
+        // "nimble_bond" namespace) lives there. Erasing NVS under a live NimBLE host
+        // invalidates state the stack still references, so the subsequent teardown
+        // panics on Core 0 in npl_freertos_eventq_remove (LoadProhibited) and the
+        // admin ACK is lost. Stop BLE before any destructive work; disableBluetooth()
+        // self-guards to a no-op on BLE-less builds.
+        disableBluetooth();
+#endif
+        // nRF52 keeps BLE active while reset cleanup performs its flash operations.
         nodeDB->factoryReset();
         LOG_INFO("Factory config reset finished, rebooting soon");
+#if !defined(ARCH_ESP32)
         disableBluetooth();
+#endif
         reboot(DEFAULT_REBOOT_SECONDS);
         break;
     }
     case meshtastic_AdminMessage_factory_reset_device_tag: {
         LOG_INFO("Initiate full factory reset");
-        nodeDB->factoryReset(true);
+#if defined(ARCH_ESP32)
+        // Same ordering constraint as the config reset above: factoryReset(true) runs
+        // nvs_flash_erase() (bonds, ssl keys, persistent vars), which must not overlap
+        // the NimBLE stack or its teardown.
         disableBluetooth();
+#endif
+        nodeDB->factoryReset(true);
+#if !defined(ARCH_ESP32)
+        disableBluetooth();
+#endif
         reboot(DEFAULT_REBOOT_SECONDS);
         break;
     }
@@ -474,12 +493,19 @@ bool AdminModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshta
         LOG_INFO("Begin settings edit transaction");
         hasOpenEditTransaction = true;
         editTransactionActivityMs = millis();
+        // Capture the begin packet's addressed local destination, not whatever nodeDB->getNodeNum()
+        // currently returns. A PKI rotation can move the in-RAM node number before the session ends,
+        // and the phone session is bound to the address it saw at begin. Only a local begin
+        // (mp.from == 0) opens a transaction whose pre-rekey self the rewrite must later resolve to
+        // the live node - a remote PKC begin, even an accepted one, must not plant a local alias.
+        if (mp.from == 0)
+            editTransactionOriginalDest = mp.to;
         break;
     }
     case meshtastic_AdminMessage_commit_edit_settings_tag: {
-        disableBluetooth();
         LOG_INFO("Commit settings edit transaction");
         hasOpenEditTransaction = false;
+        editTransactionOriginalDest = 0;
         deferredEditSegments = 0;
         saveChanges(SEGMENT_CONFIG | SEGMENT_MODULECONFIG | SEGMENT_DEVICESTATE | SEGMENT_CHANNELS | SEGMENT_NODEDATABASE);
         flushChannelWarnings(); // one coalesced message for everything edited in this transaction
@@ -649,12 +675,13 @@ bool AdminModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshta
     }
     case meshtastic_AdminMessage_restore_preferences_tag: {
         LOG_INFO("Client requests preferences restore");
-        if (nodeDB->restorePreferences(r->backup_preferences,
+        if (nodeDB->restorePreferences(r->restore_preferences,
                                        SEGMENT_DEVICESTATE | SEGMENT_CONFIG | SEGMENT_MODULECONFIG | SEGMENT_CHANNELS)) {
             myReply = allocErrorResponse(meshtastic_Routing_Error_NONE, &mp);
             LOG_DEBUG("Rebooting after preferences restore");
-            reboot(1000);
-            disableBluetooth();
+            // reboot() accepts seconds. Keep the active transport alive so want_response clients
+            // can receive the success reply before the scheduled reboot owns final teardown.
+            reboot(DEFAULT_REBOOT_SECONDS);
         } else {
             myReply = allocErrorResponse(meshtastic_Routing_Error_BAD_REQUEST, &mp);
         }
@@ -1250,8 +1277,9 @@ bool AdminModule::handleSetModuleConfig(const meshtastic_ModuleConfig &c)
         if (!MQTT::isValidConfig(c.payload_variant.mqtt)) {
             return false;
         }
-        // Disable Bluetooth to prevent interference during MQTT configuration
-        disableBluetooth();
+        // A transaction still needs this transport for the remaining writes and commit.
+        if (!hasOpenEditTransaction)
+            disableBluetooth();
         moduleConfig.has_mqtt = true;
         {
             char prevPass[sizeof(moduleConfig.mqtt.password)];
@@ -1269,7 +1297,8 @@ bool AdminModule::handleSetModuleConfig(const meshtastic_ModuleConfig &c)
             LOG_ERROR("Invalid serial config");
             return false;
         }
-        disableBluetooth(); // Disable Bluetooth to prevent interference during Serial configuration
+        if (!hasOpenEditTransaction)
+            disableBluetooth(); // Prevent interference during standalone Serial configuration.
         moduleConfig.has_serial = true;
         moduleConfig.serial = c.payload_variant.serial;
         break;
@@ -1866,6 +1895,7 @@ void AdminModule::expireStaleEditTransaction()
 
     LOG_WARN("Edit transaction abandoned for %us; committing what it applied", EDIT_TRANSACTION_IDLE_MS / 1000);
     hasOpenEditTransaction = false;
+    editTransactionOriginalDest = 0;
     int segments = deferredEditSegments;
     deferredEditSegments = 0;
     // No reboot: the settings are already live in RAM and the client that would expect one is gone.
@@ -2474,8 +2504,25 @@ void AdminModule::warnOnLoraPresetChange(const meshtastic_Config_LoRaConfig &old
     }
 } // warnOnLoraPresetChange
 
+#ifdef PIO_UNIT_TESTING
+static uint32_t disableBluetoothCallCountForTest = 0;
+
+uint32_t getDisableBluetoothCallCountForTest()
+{
+    return disableBluetoothCallCountForTest;
+}
+
+void resetDisableBluetoothCallCountForTest()
+{
+    disableBluetoothCallCountForTest = 0;
+}
+#endif
+
 void disableBluetooth()
 {
+#ifdef PIO_UNIT_TESTING
+    disableBluetoothCallCountForTest++;
+#endif
 #if HAS_BLUETOOTH
 #ifdef ARCH_ESP32
     if (nimbleBluetooth)

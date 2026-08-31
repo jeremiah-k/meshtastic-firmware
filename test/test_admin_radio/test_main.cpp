@@ -20,8 +20,10 @@
 #include "RadioInterface.h"
 #include "TestUtil.h"
 #include "graphics/draw/MenuHandler.h"
+#include "main.h"
 #include "mesh/Channels.h"
 #include "mesh/Router.h" // router global: allocErrorResponse() allocates the reply through it
+#include "mesh/TypeConversions.h"
 #include "modules/AdminModule.h"
 #include "modules/NodeInfoModule.h"
 #include <ErriezCRC32.h> // crc32Buffer(), for the my_node_num == crc32(public_key) invariant
@@ -1308,6 +1310,38 @@ static void test_bootDefense_sanitizesStaleLicensedChannelsOnce()
     TEST_ASSERT_FALSE_MESSAGE(channels.ensureLicensedOperation(), "boot sanitation must be idempotent");
 }
 
+static void test_restorePreferences_incompleteBackupDoesNotPartiallyMutateState()
+{
+    const auto originalConfig = config;
+    const meshtastic_User originalOwner = owner;
+    config.lora.hop_limit = 3;
+    strncpy(owner.long_name, "Current Owner", sizeof(owner.long_name) - 1);
+    owner.long_name[sizeof(owner.long_name) - 1] = '\0';
+
+    meshtastic_BackupPreferences incomplete = meshtastic_BackupPreferences_init_zero;
+    incomplete.version = DEVICESTATE_CUR_VER;
+    incomplete.has_config = true;
+    incomplete.config = config;
+    incomplete.config.lora.hop_limit = 7;
+    // Intentionally omit owner while asking restorePreferences() for DEVICESTATE.
+
+    size_t encodedSize = 0;
+    TEST_ASSERT_TRUE(pb_get_encoded_size(&encodedSize, meshtastic_BackupPreferences_fields, &incomplete));
+    // The direct saveProto() bypasses backupPreferences(), which is what normally mkdirs /backups;
+    // the per-suite sandbox starts without it and the atomic write needs the directory to exist.
+    FSCom.mkdir("/backups");
+    TEST_ASSERT_TRUE(nodeDB->saveProto(backupFileName, encodedSize, &meshtastic_BackupPreferences_msg, &incomplete));
+
+    TEST_ASSERT_FALSE(
+        nodeDB->restorePreferences(meshtastic_AdminMessage_BackupLocation_FLASH, SEGMENT_CONFIG | SEGMENT_DEVICESTATE));
+    TEST_ASSERT_EQUAL_UINT8(3, config.lora.hop_limit);
+    TEST_ASSERT_EQUAL_STRING("Current Owner", owner.long_name);
+
+    config = originalConfig;
+    owner = originalOwner;
+    FSCom.remove(backupFileName);
+}
+
 static void test_restorePreferences_sanitizesLicensedBackupBeforeReturn()
 {
     NodeDB *savedNodeDB = nodeDB;
@@ -1334,6 +1368,70 @@ static void test_restorePreferences_sanitizesLicensedBackupBeforeReturn()
     FSCom.remove(backupFileName);
     delete nodeDB;
     nodeDB = savedNodeDB;
+}
+
+static void test_restorePreferences_ownerIsVisibleThroughSelfNodeImmediately()
+{
+    const uint32_t self = nodeDB->getNodeNum();
+    const meshtastic_User originalOwner = owner;
+    const auto originalSecurity = config.security;
+    meshtastic_NodeInfoLite *selfEntry = nodeDB->getMeshNode(self);
+    TEST_ASSERT_NOT_NULL(selfEntry);
+    const meshtastic_NodeInfoLite originalSelf = *selfEntry;
+
+    meshtastic_User backedUpOwner = owner;
+    strncpy(backedUpOwner.long_name, "Backup Owner", sizeof(backedUpOwner.long_name) - 1);
+    backedUpOwner.long_name[sizeof(backedUpOwner.long_name) - 1] = '\0';
+    strncpy(backedUpOwner.short_name, "BKUP", sizeof(backedUpOwner.short_name) - 1);
+    backedUpOwner.short_name[sizeof(backedUpOwner.short_name) - 1] = '\0';
+    backedUpOwner.has_is_unmessagable = true;
+    backedUpOwner.is_unmessagable = true;
+    config.security.public_key.size = 32;
+    memset(config.security.public_key.bytes, 0x3a, sizeof(config.security.public_key.bytes));
+    backedUpOwner.public_key.size = 32;
+    memcpy(backedUpOwner.public_key.bytes, config.security.public_key.bytes, sizeof(backedUpOwner.public_key.bytes));
+    owner = backedUpOwner;
+    TypeConversions::CopyUserToNodeInfoLite(selfEntry, owner);
+    TEST_ASSERT_TRUE(nodeDB->backupPreferences(meshtastic_AdminMessage_BackupLocation_FLASH));
+
+    strncpy(owner.long_name, "Changed Owner", sizeof(owner.long_name) - 1);
+    owner.long_name[sizeof(owner.long_name) - 1] = '\0';
+    strncpy(owner.short_name, "CHNG", sizeof(owner.short_name) - 1);
+    owner.short_name[sizeof(owner.short_name) - 1] = '\0';
+    owner.is_unmessagable = false;
+    config.security.public_key.size = 32;
+    memset(config.security.public_key.bytes, 0x7c, sizeof(config.security.public_key.bytes));
+    owner.public_key.size = 32;
+    memcpy(owner.public_key.bytes, config.security.public_key.bytes, sizeof(owner.public_key.bytes));
+    TypeConversions::CopyUserToNodeInfoLite(selfEntry, owner);
+    selfEntry->channel = 7;
+    nodeInfoLiteSetBit(selfEntry, NODEINFO_BITFIELD_IS_MUTED_MASK, true);
+
+    TEST_ASSERT_TRUE(
+        nodeDB->restorePreferences(meshtastic_AdminMessage_BackupLocation_FLASH, SEGMENT_CONFIG | SEGMENT_DEVICESTATE));
+    TEST_ASSERT_TRUE(devicestate.has_owner);
+    TEST_ASSERT_EQUAL_STRING("Backup Owner", owner.long_name);
+    TEST_ASSERT_EQUAL_STRING("BKUP", owner.short_name);
+    TEST_ASSERT_TRUE(owner.has_is_unmessagable);
+    TEST_ASSERT_TRUE(owner.is_unmessagable);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(backedUpOwner.public_key.bytes, owner.public_key.bytes, 32);
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(backedUpOwner.public_key.bytes, config.security.public_key.bytes, 32);
+
+    selfEntry = nodeDB->getMeshNode(self);
+    TEST_ASSERT_NOT_NULL(selfEntry);
+    TEST_ASSERT_EQUAL_STRING("Backup Owner", selfEntry->long_name);
+    TEST_ASSERT_EQUAL_STRING("BKUP", selfEntry->short_name);
+    TEST_ASSERT_TRUE(nodeInfoLiteHasIsUnmessagable(selfEntry));
+    TEST_ASSERT_TRUE(nodeInfoLiteIsUnmessagable(selfEntry));
+    TEST_ASSERT_EQUAL_UINT8_ARRAY(backedUpOwner.public_key.bytes, selfEntry->public_key.bytes, 32);
+    TEST_ASSERT_EQUAL_UINT8(7, selfEntry->channel);
+    TEST_ASSERT_TRUE(nodeInfoLiteIsMuted(selfEntry));
+
+    config.security = originalSecurity;
+    owner = originalOwner;
+    *selfEntry = originalSelf;
+    TEST_ASSERT_TRUE(nodeDB->saveToDisk(SEGMENT_CONFIG | SEGMENT_DEVICESTATE | SEGMENT_NODEDATABASE));
+    FSCom.remove(backupFileName);
 }
 
 static meshtastic_Config makeLoraSetConfig(meshtastic_Config_LoRaConfig_RegionCode region, bool usePreset,
@@ -1868,11 +1966,13 @@ static meshtastic_Channel makeChannel(int8_t index, meshtastic_Channel_Role role
 
 // Dispatch one admin message as if it arrived from a local (from==0) client, which bypasses
 // the passkey/authorization gates so the switch body runs.
-static void sendAdmin(meshtastic_AdminMessage &m)
+static void sendAdmin(meshtastic_AdminMessage &m, bool wantResponse = false, uint32_t packetId = 0)
 {
     meshtastic_MeshPacket mp = meshtastic_MeshPacket_init_zero;
     mp.from = 0;
+    mp.id = packetId;
     mp.which_payload_variant = meshtastic_MeshPacket_decoded_tag; // required: handler drops non-decoded packets
+    mp.decoded.want_response = wantResponse;
     testAdmin->handleReceivedProtobuf(mp, &m);
 }
 
@@ -1892,12 +1992,12 @@ static void sendBeginEdit()
     sendAdmin(m);
 }
 
-static void sendCommitEdit()
+static void sendCommitEdit(bool wantResponse = false, uint32_t packetId = 0)
 {
     meshtastic_AdminMessage m = meshtastic_AdminMessage_init_zero;
     m.which_payload_variant = meshtastic_AdminMessage_commit_edit_settings_tag;
     m.commit_edit_settings = true;
-    sendAdmin(m);
+    sendAdmin(m, wantResponse, packetId);
 }
 
 // An admin message that changes nothing. It answers, so drain the reply or the packet pool leaks.
@@ -2123,6 +2223,58 @@ static void test_toggleMutedNode_skipsRadioReload_butPersists()
     TEST_ASSERT_TRUE(nodeInfoLiteIsMuted(nodeDB->getMeshNode(TEST_NODE_NUM)));
 }
 
+// Test seam defined in AdminModule.cpp under PIO_UNIT_TESTING.
+extern uint32_t getDisableBluetoothCallCountForTest();
+extern void resetDisableBluetoothCallCountForTest();
+
+static meshtastic_ModuleConfig makeMqttModuleConfig()
+{
+    meshtastic_ModuleConfig config = meshtastic_ModuleConfig_init_zero;
+    config.which_payload_variant = meshtastic_ModuleConfig_mqtt_tag;
+    config.payload_variant.mqtt = meshtastic_ModuleConfig_MQTTConfig_init_zero;
+    return config;
+}
+
+static meshtastic_ModuleConfig makeSerialModuleConfig()
+{
+    meshtastic_ModuleConfig config = meshtastic_ModuleConfig_init_zero;
+    config.which_payload_variant = meshtastic_ModuleConfig_serial_tag;
+    config.payload_variant.serial = meshtastic_ModuleConfig_SerialConfig_init_zero;
+    return config;
+}
+
+static void test_mqttConfig_standaloneDisablesBluetooth()
+{
+    resetDisableBluetoothCallCountForTest();
+    TEST_ASSERT_TRUE(testAdmin->handleSetModuleConfig(makeMqttModuleConfig()));
+    TEST_ASSERT_EQUAL_UINT32(1, getDisableBluetoothCallCountForTest());
+}
+
+static void test_mqttConfig_transactionPreservesBluetooth()
+{
+    sendBeginEdit();
+    resetDisableBluetoothCallCountForTest();
+    TEST_ASSERT_TRUE(testAdmin->handleSetModuleConfig(makeMqttModuleConfig()));
+    TEST_ASSERT_EQUAL_UINT32(0, getDisableBluetoothCallCountForTest());
+    sendCommitEdit();
+}
+
+static void test_serialConfig_standaloneDisablesBluetooth()
+{
+    resetDisableBluetoothCallCountForTest();
+    TEST_ASSERT_TRUE(testAdmin->handleSetModuleConfig(makeSerialModuleConfig()));
+    TEST_ASSERT_EQUAL_UINT32(1, getDisableBluetoothCallCountForTest());
+}
+
+static void test_serialConfig_transactionPreservesBluetooth()
+{
+    sendBeginEdit();
+    resetDisableBluetoothCallCountForTest();
+    TEST_ASSERT_TRUE(testAdmin->handleSetModuleConfig(makeSerialModuleConfig()));
+    TEST_ASSERT_EQUAL_UINT32(0, getDisableBluetoothCallCountForTest());
+    sendCommitEdit();
+}
+
 // -----------------------------------------------------------------------
 // Node menu mute toggle (graphics::menuHandler::toggleNodeMuted)
 // -----------------------------------------------------------------------
@@ -2157,26 +2309,20 @@ static void test_toggleNodeMuted_unknownNodeDoesNothing()
     TEST_ASSERT_NULL(nodeDB->getMeshNode(0xDEADBEEF));
 }
 
-// CHARACTERIZATION OF A KNOWN DEFECT, not an endorsement. Flipping one NodeInfoLite bit currently
-// calls bare nodeDB->saveToDisk(), which rewrites all five segments. saveToDisk() is not virtual,
-// so the mask is observed through its effect: every prefs file reappears after being removed.
-//
-// A pending fix narrows this to SEGMENT_NODEDATABASE. When it lands, only nodes.proto should come
-// back and this assertion is EXPECTED to change - that diff is the point, so the improvement is
-// visible instead of silent.
-static void test_toggleNodeMuted_currentlyRewritesEverySegment()
+static void test_toggleNodeMuted_persistsOnlyNodeDatabase()
 {
     nodeDB->getOrCreateMeshNode(TEST_NODE_NUM);
 
-    const char *segmentFiles[] = {configFileName, moduleConfigFileName, deviceStateFileName, channelFileName,
-                                  nodeDatabaseFileName};
-    for (const char *f : segmentFiles)
+    const char *unrelatedSegmentFiles[] = {configFileName, moduleConfigFileName, deviceStateFileName, channelFileName};
+    for (const char *f : unrelatedSegmentFiles)
         FSCom.remove(f);
+    FSCom.remove(nodeDatabaseFileName);
 
     graphics::menuHandler::toggleNodeMuted(TEST_NODE_NUM);
 
-    for (const char *f : segmentFiles)
-        TEST_ASSERT_TRUE_MESSAGE(FSCom.exists(f), f);
+    TEST_ASSERT_TRUE(FSCom.exists(nodeDatabaseFileName));
+    for (const char *f : unrelatedSegmentFiles)
+        TEST_ASSERT_FALSE_MESSAGE(FSCom.exists(f), f);
 }
 
 // -----------------------------------------------------------------------
@@ -2265,6 +2411,69 @@ static void test_presetForRegionSelection_ignoresNodesOnRawModemSettings()
 }
 #endif // HAS_SCREEN
 
+static void assertRoutingSuccessReply(uint32_t requestId)
+{
+    const auto *reply = testAdmin->reply();
+    TEST_ASSERT_NOT_NULL(reply);
+    TEST_ASSERT_EQUAL_UINT32(requestId, reply->decoded.request_id);
+    TEST_ASSERT_EQUAL(meshtastic_PortNum_ROUTING_APP, reply->decoded.portnum);
+
+    meshtastic_Routing routing = meshtastic_Routing_init_zero;
+    TEST_ASSERT_TRUE(
+        pb_decode_from_bytes(reply->decoded.payload.bytes, reply->decoded.payload.size, &meshtastic_Routing_msg, &routing));
+    TEST_ASSERT_EQUAL(meshtastic_Routing_Error_NONE, routing.error_reason);
+}
+
+static meshtastic_ModuleConfig makeCommitResponseMqttModuleConfig()
+{
+    meshtastic_ModuleConfig config = meshtastic_ModuleConfig_init_zero;
+    config.which_payload_variant = meshtastic_ModuleConfig_mqtt_tag;
+    config.payload_variant.mqtt = meshtastic_ModuleConfig_MQTTConfig_init_zero;
+    return config;
+}
+
+static void test_commitResponse_keepsTransportAliveUntilScheduledReboot()
+{
+    sendBeginEdit();
+    TEST_ASSERT_TRUE(testAdmin->handleSetModuleConfig(makeCommitResponseMqttModuleConfig()));
+    resetDisableBluetoothCallCountForTest();
+
+    constexpr uint32_t requestId = 0xC011117;
+    sendCommitEdit(true, requestId);
+
+    assertRoutingSuccessReply(requestId);
+    TEST_ASSERT_FALSE(testAdmin->editTransactionOpen());
+    TEST_ASSERT_EQUAL_UINT32(0, getDisableBluetoothCallCountForTest());
+    testAdmin->drainReply();
+}
+
+static void test_restorePreferences_replyPrecedesDefaultRebootAndTransportTeardown()
+{
+    TEST_ASSERT_TRUE(nodeDB->backupPreferences(meshtastic_AdminMessage_BackupLocation_FLASH));
+    rebootAtMsec = 0;
+    resetDisableBluetoothCallCountForTest();
+
+    meshtastic_AdminMessage restore = meshtastic_AdminMessage_init_zero;
+    restore.which_payload_variant = meshtastic_AdminMessage_restore_preferences_tag;
+    restore.restore_preferences = meshtastic_AdminMessage_BackupLocation_FLASH;
+    constexpr uint32_t requestId = 0xBA6C001;
+    const uint32_t beforeRestore = millis();
+    sendAdmin(restore, true, requestId);
+
+    assertRoutingSuccessReply(requestId);
+    TEST_ASSERT_NOT_EQUAL(0, rebootAtMsec);
+    const uint32_t scheduledDelayMs = rebootAtMsec - beforeRestore;
+    TEST_ASSERT_TRUE_MESSAGE(scheduledDelayMs >= DEFAULT_REBOOT_SECONDS * 1000,
+                             "restore reboot was scheduled earlier than the default delay");
+    TEST_ASSERT_TRUE_MESSAGE(scheduledDelayMs < (DEFAULT_REBOOT_SECONDS + 2) * 1000,
+                             "restore reboot delay is unexpectedly long; reboot() takes seconds, not milliseconds");
+    TEST_ASSERT_EQUAL_UINT32(0, getDisableBluetoothCallCountForTest());
+
+    testAdmin->drainReply();
+    rebootAtMsec = 0;
+    FSCom.remove(backupFileName);
+}
+
 // -----------------------------------------------------------------------
 // Test runner
 // -----------------------------------------------------------------------
@@ -2310,7 +2519,9 @@ void setup()
     RUN_TEST(test_handleSetConfig_persistsLicensedFirstRegionIdentity);
     RUN_TEST(test_handleSetConfig_persistsUnlicensedFirstRegionIdentity);
     RUN_TEST(test_bootDefense_sanitizesStaleLicensedChannelsOnce);
+    RUN_TEST(test_restorePreferences_incompleteBackupDoesNotPartiallyMutateState);
     RUN_TEST(test_restorePreferences_sanitizesLicensedBackupBeforeReturn);
+    RUN_TEST(test_restorePreferences_ownerIsVisibleThroughSelfNodeImmediately);
     RUN_TEST(test_getRegion_returnsCorrectRegion_US);
     RUN_TEST(test_getRegion_returnsCorrectRegion_EU868);
     RUN_TEST(test_getRegion_returnsCorrectRegion_LORA24);
@@ -2405,6 +2616,12 @@ void setup()
     RUN_TEST(test_handleSetConfig_presetChosenBeforeRegionSurvives);
     RUN_TEST(test_handleSetConfig_unsettingRegionKeepsPreset);
 
+    // Module-config transport gating (BLE preserved inside edit transactions)
+    RUN_TEST(test_mqttConfig_standaloneDisablesBluetooth);
+    RUN_TEST(test_mqttConfig_transactionPreservesBluetooth);
+    RUN_TEST(test_serialConfig_standaloneDisablesBluetooth);
+    RUN_TEST(test_serialConfig_transactionPreservesBluetooth);
+
     // Channel-configuration warning + coalescing
     RUN_TEST(test_warn_singleChannel_variantName_oneSpecificMessage);
     RUN_TEST(test_warn_singleChannel_nameAndPsk_collapsedToCatchAll);
@@ -2416,6 +2633,8 @@ void setup()
     RUN_TEST(test_editTransaction_active_isNotRetired);
     RUN_TEST(test_warn_license_noTransaction_emittedImmediately);
     RUN_TEST(test_warn_license_transaction_coalescedToSingleMessage);
+    RUN_TEST(test_commitResponse_keepsTransportAliveUntilScheduledReboot);
+    RUN_TEST(test_restorePreferences_replyPrecedesDefaultRebootAndTransportTeardown);
 
     // Node-DB metadata saves must not reconfigure the radio
     RUN_TEST(test_setFavoriteNode_skipsRadioReload_butPersists);
@@ -2426,7 +2645,7 @@ void setup()
     // Node menu mute toggle
     RUN_TEST(test_toggleNodeMuted_flipsBitAndSkipsRadioReload);
     RUN_TEST(test_toggleNodeMuted_unknownNodeDoesNothing);
-    RUN_TEST(test_toggleNodeMuted_currentlyRewritesEverySegment);
+    RUN_TEST(test_toggleNodeMuted_persistsOnlyNodeDatabase);
 
     // BaseUI region chooser preset default
 #ifndef USERPREFS_LORACONFIG_MODEM_PRESET
