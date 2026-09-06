@@ -4605,7 +4605,7 @@ bool NodeDB::backupPreferences(meshtastic_AdminMessage_BackupLocation location)
         success = saveProto(backupFileName, backupSize, &meshtastic_BackupPreferences_msg, &backup);
 
         if (success) {
-            LOG_INFO("Saved backup preferences");
+            LOG_INFO("Saved backup preferences owner '%s'/'%s'", owner.long_name, owner.short_name);
         } else {
             LOG_ERROR("Save backup prefs to file failed");
         }
@@ -4633,6 +4633,26 @@ bool NodeDB::restorePreferences(meshtastic_AdminMessage_BackupLocation location,
         success = loadProto(backupFileName, meshtastic_BackupPreferences_size, sizeof(meshtastic_BackupPreferences),
                             &meshtastic_BackupPreferences_msg, &backup);
         if (success) {
+            meshtastic_NodeInfoLite *restoredSelf = nullptr;
+            if (restoreWhat & SEGMENT_DEVICESTATE) {
+                const auto &restoredSecurity = (restoreWhat & SEGMENT_CONFIG) ? backup.config.security : config.security;
+                // An empty owner key makes no identity claim (licensed/Ham mode or a pre-keygen
+                // backup), so only a non-empty backup key must match this device's security config.
+                const bool keyMatchesConfig =
+                    backup.owner.public_key.size == 0 ||
+                    (backup.owner.public_key.size == restoredSecurity.public_key.size &&
+                     memcmp(backup.owner.public_key.bytes, restoredSecurity.public_key.bytes, backup.owner.public_key.size) == 0);
+                if (!keyMatchesConfig) {
+                    LOG_ERROR("Restore owner key mismatch");
+                    return false;
+                }
+                restoredSelf = getOrCreateMeshNode(getNodeNum());
+                if (!restoredSelf) {
+                    LOG_ERROR("Restore prefs from backup failed");
+                    return false;
+                }
+            }
+
             if (restoreWhat & SEGMENT_CONFIG) {
                 config = backup.config;
                 LOG_DEBUG("Restored config");
@@ -4641,9 +4661,12 @@ bool NodeDB::restorePreferences(meshtastic_AdminMessage_BackupLocation location,
                 moduleConfig = backup.module_config;
                 LOG_DEBUG("Restored module config");
             }
+            bool ownerRestored = false;
             if (restoreWhat & SEGMENT_DEVICESTATE) {
                 devicestate.owner = backup.owner;
-                LOG_DEBUG("Restored device state");
+                devicestate.has_owner = true;
+                ownerRestored = true;
+                LOG_INFO("Restored device state owner '%s'/'%s'", backup.owner.long_name, backup.owner.short_name);
             }
             if (restoreWhat & SEGMENT_CHANNELS) {
                 channelFile = backup.channels;
@@ -4656,6 +4679,17 @@ bool NodeDB::restorePreferences(meshtastic_AdminMessage_BackupLocation location,
             }
             if (restoreWhat & SEGMENT_CHANNELS)
                 channels.onConfigChanged();
+
+            if (ownerRestored) {
+                if (owner.public_key.size == 0 && config.security.public_key.size == sizeof(owner.public_key.bytes)) {
+                    owner.public_key.size = config.security.public_key.size;
+                    memcpy(owner.public_key.bytes, config.security.public_key.bytes, owner.public_key.size);
+                }
+                TypeConversions::CopyUserToNodeInfoLite(restoredSelf, owner);
+                updateGUIforNode = restoredSelf;
+                notifyObservers(true);
+                restoreWhat |= SEGMENT_NODEDATABASE;
+            }
 
             success = saveToDisk(restoreWhat);
             if (success) {
