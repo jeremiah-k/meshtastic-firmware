@@ -482,7 +482,6 @@ bool AdminModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshta
         break;
     }
     case meshtastic_AdminMessage_commit_edit_settings_tag: {
-        disableBluetooth();
         LOG_INFO("Commit settings edit transaction");
         const bool shouldReboot = deferredEditReboot;
         hasOpenEditTransaction = false;
