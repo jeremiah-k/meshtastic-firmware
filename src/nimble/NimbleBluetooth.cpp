@@ -563,6 +563,12 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
         Classic ESP32 uses conservative intervals because its BLE controller can assert at 7.5ms. Other targets keep the
         aggressive timing for the short initial setup window.
         */
+#ifdef CONFIG_IDF_TARGET_ESP32
+        // 30-50ms is slower than the 12-16ms the central picks for itself, so this request can only
+        // downgrade the link; applied mid-handshake it aborts the client's in-flight GATT reads.
+        LOG_DEBUG("BLE conn %u keep central-owned params during config (classic ESP32)", conn_handle);
+        return;
+#endif
         LOG_INFO("BLE requestHighThroughputConnection");
         BleConnParams params{kHighThroughputMinInterval, kHighThroughputMaxInterval, 0, 600};
         logConnParamRequest("high-throughput", conn_handle, connParamScheduler.request(conn_handle, params));
@@ -896,8 +902,10 @@ class NimbleBluetoothServerCallback : public BLEServerCallbacks
 #endif
 
         LOG_INFO("BLE conn %u peer MTU %u (target %u)", connHandle, pServer->getPeerMTU(connHandle), kPreferredBleMtu);
+#ifndef CONFIG_IDF_TARGET_ESP32
         BleConnParams params{kHighThroughputMinInterval, kHighThroughputMaxInterval, 0, 600};
         logConnParamRequest("connect", connHandle, connParamScheduler.request(connHandle, params));
+#endif
     }
 
     void onDisconnect(BLEServer *pServer, struct ble_gap_conn_desc *desc)
