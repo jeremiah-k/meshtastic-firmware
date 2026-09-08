@@ -555,6 +555,10 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
             latency: 0 (don't allow peripheral to skip any connection events)
             timeout (units of 10ms): 6 seconds = 600 (supervision timeout)
         */
+#ifdef CONFIG_IDF_TARGET_ESP32
+        LOG_DEBUG("BLE conn %u preserve central-selected params (classic ESP32)", conn_handle);
+        return;
+#endif
         LOG_INFO("BLE requestHighThroughputConnection");
         BleConnParams params{kHighThroughputMinInterval, kHighThroughputMaxInterval, 0, 600};
         logConnParamRequest("high-throughput", conn_handle, connParamScheduler.request(conn_handle, params));
@@ -562,6 +566,10 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
 
     void requestLowerPowerConnection(uint16_t conn_handle)
     {
+#ifdef CONFIG_IDF_TARGET_ESP32
+        LOG_DEBUG("BLE conn %u preserve central-selected params (classic ESP32)", conn_handle);
+        return;
+#endif
         /* Request a lower power consumption (but higher latency, lower throughput) BLE connection.
 
         This is suitable for steady-state operation after initial setup is complete.
@@ -888,8 +896,10 @@ class NimbleBluetoothServerCallback : public BLEServerCallbacks
 #endif
 
         LOG_INFO("BLE conn %u peer MTU %u (target %u)", connHandle, pServer->getPeerMTU(connHandle), kPreferredBleMtu);
+#ifndef CONFIG_IDF_TARGET_ESP32
         BleConnParams params{kHighThroughputMinInterval, kHighThroughputMaxInterval, 0, 600};
         logConnParamRequest("connect", connHandle, connParamScheduler.request(connHandle, params));
+#endif
     }
 
     void onDisconnect(BLEServer *pServer, struct ble_gap_conn_desc *desc)
