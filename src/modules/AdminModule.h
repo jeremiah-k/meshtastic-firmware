@@ -45,11 +45,16 @@ class AdminModule : public ProtobufModule<meshtastic_AdminMessage>, public Obser
     static constexpr uint32_t EDIT_TRANSACTION_IDLE_MS = 60 * 1000;
     uint32_t editTransactionActivityMs = 0; // millis() of the last save this transaction deferred
     int deferredEditSegments = 0;           // segments that transaction has touched but not yet saved
+    bool deferredEditReboot = false;        // any deferred change requires a reboot to take effect
     /// Retire an open edit transaction whose client stopped talking, persisting what it applied.
     void expireStaleEditTransaction();
 #ifdef PIO_UNIT_TESTING
     int lastSaveWhatForTest = 0;
 #endif
+    // `mp.from` for the open transaction; local phone transports use 0.
+    NodeNum editTransactionOwner = 0;
+    // Local destination seen at transaction begin; used to resolve phone writes after rekey.
+    NodeNum editTransactionOriginalDest = 0;
 
     uint8_t session_passkey[8] = {0};
     uint32_t session_time = 0;        // millis() when the current session passkey was issued
@@ -102,6 +107,9 @@ class AdminModule : public ProtobufModule<meshtastic_AdminMessage>, public Obser
     /// Note an admin request leaving this node for a remote, so that remote's response is
     /// accepted. Called from the client-to-mesh path (MeshService::handleToRadio).
     void noteOutgoingAdminRequest(const meshtastic_MeshPacket &p);
+
+    /// Local destination recorded at begin_edit_settings, or 0 when no alias is active.
+    NodeNum getEditTransactionOriginalDest() const;
 
   private:
     // An admin response has no session passkey and its sender need not hold an admin key, so a
@@ -176,3 +184,7 @@ static constexpr const char *publicChannelPrecisionMessage =
 extern AdminModule *adminModule;
 
 void disableBluetooth();
+#ifdef PIO_UNIT_TESTING
+uint32_t getDisableBluetoothCallCountForTest();
+void resetDisableBluetoothCallCountForTest();
+#endif

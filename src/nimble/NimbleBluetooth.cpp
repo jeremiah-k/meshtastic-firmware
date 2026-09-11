@@ -1,5 +1,6 @@
 #include "configuration.h"
 #if !MESHTASTIC_EXCLUDE_BLUETOOTH
+#include "BleConnParamScheduler.h"
 #include "BluetoothCommon.h"
 #include "NimbleBluetooth.h"
 #include "PowerFSM.h"
@@ -27,6 +28,9 @@
 #ifdef ARCH_ESP32
 #include <nvs.h>
 #include <nvs_flash.h>
+#if defined(CONFIG_IDF_TARGET_ESP32)
+#include <esp_bt.h>
+#endif
 #endif
 
 namespace
@@ -34,6 +38,126 @@ namespace
 constexpr uint16_t kPreferredBleMtu = 517;
 constexpr uint16_t kPreferredBleTxOctets = 251;
 constexpr uint16_t kPreferredBleTxTimeUs = (kPreferredBleTxOctets + 14) * 8;
+
+constexpr uint16_t kHighThroughputMinInterval = 6;  // 7.5ms
+constexpr uint16_t kHighThroughputMaxInterval = 12; // 15ms
+
+} // namespace
+namespace
+{
+// Translate NimBLE submission results; EALREADY means an existing procedure owns
+// the next completion event, while other failures produce no completion.
+struct NimbleGapConnParamSender {
+    BleConnParamSendResult send(uint16_t connHandle, BleConnParams params)
+    {
+        ble_gap_upd_params gap;
+        gap.itvl_min = params.minInterval;
+        gap.itvl_max = params.maxInterval;
+        gap.latency = params.latency;
+        gap.supervision_timeout = params.timeout;
+        gap.min_ce_len = BLE_GAP_INITIAL_CONN_MIN_CE_LEN;
+        gap.max_ce_len = BLE_GAP_INITIAL_CONN_MAX_CE_LEN;
+        int rc = ble_gap_update_params(connHandle, &gap);
+        return rc == 0 ? BleConnParamSendResult::Sent
+                       : (rc == BLE_HS_EALREADY ? BleConnParamSendResult::Busy : BleConnParamSendResult::Refused);
+    }
+};
+
+NimbleGapConnParamSender bleConnParamSender;
+BleConnParamSchedulerT<NimbleGapConnParamSender> connParamScheduler(bleConnParamSender);
+
+void logConnParamRequest(const char *what, uint16_t connHandle, BleConnParamSendResult result)
+{
+    switch (result) {
+    case BleConnParamSendResult::Sent:
+        LOG_DEBUG("BLE conn %u %s params sent", connHandle, what);
+        break;
+    case BleConnParamSendResult::Busy:
+        LOG_INFO("BLE conn %u %s params queued behind in-flight update", connHandle, what);
+        break;
+    case BleConnParamSendResult::Refused:
+        LOG_WARN("BLE conn %u %s params refused; dropped", connHandle, what);
+        break;
+    default:
+        break;
+    }
+}
+
+// Stable names for scheduler outcomes emitted in connection diagnostics.
+const char *connParamResultName(BleConnParamSendResult result)
+{
+    switch (result) {
+    case BleConnParamSendResult::Sent:
+        return "sent";
+    case BleConnParamSendResult::Busy:
+        return "busy-deferred";
+    case BleConnParamSendResult::Refused:
+        return "refused-dropped";
+    case BleConnParamSendResult::Drained:
+        return "drained-idle";
+    case BleConnParamSendResult::Ignored:
+        return "unmatched";
+    default:
+        return "unknown";
+    }
+}
+
+void logGapConnect(uint16_t connHandle, int status)
+{
+    if (status != 0) {
+        LOG_WARN("BLE connect failed status=%d", status);
+        return;
+    }
+    // Initial negotiated parameters ride the existing onConnect descriptor line.
+    LOG_DEBUG("BLE connect conn %u status=0", connHandle);
+}
+
+void logGapConnUpdate(uint16_t connHandle, int status, BleConnParamSendResult result)
+{
+    if (status != 0) {
+        LOG_WARN("BLE conn %u update failed status=%d result=%s", connHandle, status, connParamResultName(result));
+        return;
+    }
+    struct ble_gap_conn_desc desc;
+    int rc = ble_gap_conn_find(connHandle, &desc);
+    if (rc != 0) {
+        LOG_WARN("BLE conn %u update accepted result=%s; params unavailable, conn find rc=%d", connHandle,
+                 connParamResultName(result), rc);
+        return;
+    }
+    LOG_DEBUG("BLE conn %u update accepted interval=%u*1.25ms latency=%u supervision_timeout=%u*10ms result=%s", connHandle,
+              desc.conn_itvl, desc.conn_latency, desc.supervision_timeout, connParamResultName(result));
+}
+
+void logGapDisconnect(const struct ble_gap_conn_desc &conn, int reason)
+{
+    LOG_INFO("BLE disconnect conn %u reason=0x%x final interval=%u*1.25ms latency=%u supervision_timeout=%u*10ms",
+             conn.conn_handle, reason, conn.conn_itvl, conn.conn_latency, conn.supervision_timeout);
+}
+
+// Feed GAP lifecycle events into the scheduler and report negotiated connection state.
+int bleConnParamGapEvent(ble_gap_event *event, void *arg)
+{
+    (void)arg;
+    switch (event->type) {
+    case BLE_GAP_EVENT_CONNECT:
+        logGapConnect(event->connect.conn_handle, event->connect.status);
+        break;
+    case BLE_GAP_EVENT_CONN_UPDATE: {
+        BleConnParamSendResult result =
+            connParamScheduler.onConnUpdateComplete(event->conn_update.conn_handle, event->conn_update.status);
+        logGapConnUpdate(event->conn_update.conn_handle, event->conn_update.status, result);
+        break;
+    }
+    case BLE_GAP_EVENT_DISCONNECT:
+        logGapDisconnect(event->disconnect.conn, event->disconnect.reason);
+        connParamScheduler.onDisconnect(event->disconnect.conn.conn_handle);
+        break;
+    default:
+        break;
+    }
+    return 0;
+}
 } // namespace
 
 #ifdef ARCH_ESP32
@@ -103,10 +227,29 @@ BLEServer *bleServer;
 static bool passkeyShowing;
 static std::atomic<uint16_t> nimbleBluetoothConnHandle{BLE_HS_CONN_HANDLE_NONE}; // BLE_HS_CONN_HANDLE_NONE means "no connection"
 
-// Set by onDisconnect to defer (re)starting advertising to the main task. A stale-bond reconnect
-// triggers a MIC failure + NimBLE host reset; re-entering ble_gap_adv_* from the disconnect
-// callback while the host is mid-reset crashes (LoadProhibited), so the main task does it instead.
+// Retry advertising from the main task after disconnects and failed connections, once the
+// host has finished releasing connection resources or recovering from a reset.
 static std::atomic<bool> pendingStartAdvertising{false};
+static std::atomic<uint16_t> failedAdvertisingConnHandle{BLE_HS_CONN_HANDLE_NONE};
+#if defined(ARCH_ESP32) && defined(CONFIG_IDF_TARGET_ESP32)
+static constexpr uint32_t kAdvertisingHealthCheckMs = 5 * 60 * 1000;
+static uint32_t lastAdvertisingHealthCheckMs;
+#endif
+
+static void queueAdvertisingRestart();
+
+static bool hasPendingFailedConnection()
+{
+    uint16_t handle = failedAdvertisingConnHandle.load();
+    if (handle == BLE_HS_CONN_HANDLE_NONE)
+        return false;
+    ble_gap_conn_desc desc;
+    if (ble_gap_conn_find(handle, &desc) == 0)
+        return true;
+    // The recorded connection is gone; clear it unless a newer failure was recorded meanwhile.
+    failedAdvertisingConnHandle.compare_exchange_strong(handle, BLE_HS_CONN_HANDLE_NONE);
+    return false;
+}
 
 // Set by deinit() before it disconnects. Makes onRead bail immediately instead of arming the
 // up-to-20s wait, so a read arriving mid-teardown can't pin the NimBLE task and stall the disconnect.
@@ -220,18 +363,32 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
   protected:
     virtual int32_t runOnce() override
     {
-        // Service a deferred advertising restart from onDisconnect, gated on ble_hs_synced() so we
-        // never re-enter the GAP API while the host is still mid-reset.
-        if (pendingStartAdvertising) {
-            if (checkIsConnected()) {
-                pendingStartAdvertising = false; // a new physical connection beat us to it; nothing to do
-            } else if (ble_hs_synced()) {
-                pendingStartAdvertising = false;
-                if (nimbleBluetooth) {
-                    nimbleBluetooth->startAdvertising();
+#if defined(ARCH_ESP32) && defined(CONFIG_IDF_TARGET_ESP32)
+        if (!bleDraining && nimbleBluetooth && nimbleBluetooth->isActive() && bleServer && bleServer->getConnectedCount() == 0 &&
+            !Throttle::isWithinTimespanMs(lastAdvertisingHealthCheckMs, kAdvertisingHealthCheckMs)) {
+            lastAdvertisingHealthCheckMs = millis();
+            const bool hostSynced = ble_hs_synced();
+            const bool advertising = hostSynced && BLEDevice::getAdvertising()->isAdvertising();
+            const auto controllerStatus = esp_bt_controller_get_status();
+
+            if (hostSynced && controllerStatus == ESP_BT_CONTROLLER_STATUS_ENABLED && !advertising) {
+                LOG_WARN("BLE idle health found advertising inactive; restarting");
+                if (!nimbleBluetooth->startAdvertising()) {
+                    queueAdvertisingRestart();
                 }
             } else {
-                return 200; // host still re-syncing after a reset; retry shortly
+                LOG_INFO("BLE idle health synced=%d advertising=%d controller=%d", hostSynced ? 1 : 0, advertising ? 1 : 0,
+                         (int)controllerStatus);
+            }
+        }
+#endif
+
+        if (pendingStartAdvertising.exchange(false)) {
+            if (!bleDraining && !checkIsConnected() && nimbleBluetooth &&
+                (!ble_hs_synced() || hasPendingFailedConnection() ||
+                 (!BLEDevice::getAdvertising()->isAdvertising() && !nimbleBluetooth->startAdvertising()))) {
+                pendingStartAdvertising = true;
+                return 200;
             }
         }
 
@@ -259,7 +416,13 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
             runOnceHandleToPhoneQueue(); // push data from getFromRadio to onRead
         }
 
-        // the run is triggered via NimbleBluetoothToRadioCallback and NimbleBluetoothFromRadioCallback
+#if defined(ARCH_ESP32) && defined(CONFIG_IDF_TARGET_ESP32)
+        // Sample host/controller state while idle without restarting advertising that still reports active.
+        if (!bleDraining && nimbleBluetooth && nimbleBluetooth->isActive() && bleServer && bleServer->getConnectedCount() == 0)
+            return kAdvertisingHealthCheckMs;
+#endif
+
+        // Otherwise the run is triggered via the BLE callbacks above.
         return INT32_MAX;
     }
 
@@ -429,17 +592,14 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
         recommendations.)
 
         Selected settings:
-            minInterval (units of 1.25ms): 7.5ms = 6 (lower than the Apple recommended minimum, but allows faster when the client
-        supports it.)
+            minInterval (units of 1.25ms): 7.5ms = 6
             maxInterval (units of 1.25ms): 15ms = 12
             latency: 0 (don't allow peripheral to skip any connection events)
             timeout (units of 10ms): 6 seconds = 600 (supervision timeout)
-
-        These are intentionally aggressive to prioritize speed over power consumption, but are only used for a few seconds at
-        setup. Not worth adjusting much.
         */
         LOG_INFO("BLE requestHighThroughputConnection");
-        bleServer->updateConnParams(conn_handle, 6, 12, 0, 600);
+        BleConnParams params{kHighThroughputMinInterval, kHighThroughputMaxInterval, 0, 600};
+        logConnParamRequest("high-throughput", conn_handle, connParamScheduler.request(conn_handle, params));
     }
 
     void requestLowerPowerConnection(uint16_t conn_handle)
@@ -462,11 +622,20 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
         per second.
         */
         LOG_INFO("BLE requestLowerPowerConnection");
-        bleServer->updateConnParams(conn_handle, 24, 40, 2, 600);
+        BleConnParams params{24, 40, 2, 600};
+        logConnParamRequest("lower-power", conn_handle, connParamScheduler.request(conn_handle, params));
     }
 };
 
 static BluetoothPhoneAPI *bluetoothPhoneAPI;
+
+static void queueAdvertisingRestart()
+{
+    pendingStartAdvertising = true;
+    if (bluetoothPhoneAPI)
+        bluetoothPhoneAPI->setIntervalFromNow(0);
+    concurrency::mainDelay.interrupt();
+}
 /**
  * Subclasses can use this as a hook to provide custom notifications for their transport (i.e. bluetooth notifies)
  */
@@ -735,7 +904,9 @@ static void resetBleSessionState()
 
     memset(lastToRadio, 0, sizeof(lastToRadio));
 
+    connParamScheduler.reset();
     nimbleBluetoothConnHandle = BLE_HS_CONN_HANDLE_NONE;
+    failedAdvertisingConnHandle = BLE_HS_CONN_HANDLE_NONE;
 }
 
 class NimbleBluetoothServerCallback : public BLEServerCallbacks
@@ -749,7 +920,8 @@ class NimbleBluetoothServerCallback : public BLEServerCallbacks
     void onConnect(BLEServer *pServer, struct ble_gap_conn_desc *desc)
     {
         BLEAddress peer_addr(desc->peer_id_addr);
-        LOG_INFO("BLE incoming connection %s", peer_addr.toString().c_str());
+        LOG_INFO("BLE incoming connection %s conn %u interval=%u*1.25ms latency=%u supervision_timeout=%u*10ms",
+                 peer_addr.toString().c_str(), desc->conn_handle, desc->conn_itvl, desc->conn_latency, desc->supervision_timeout);
 
         const uint16_t connHandle = desc->conn_handle;
 
@@ -767,7 +939,8 @@ class NimbleBluetoothServerCallback : public BLEServerCallbacks
 #endif
 
         LOG_INFO("BLE conn %u peer MTU %u (target %u)", connHandle, pServer->getPeerMTU(connHandle), kPreferredBleMtu);
-        pServer->updateConnParams(connHandle, 6, 12, 0, 200);
+        BleConnParams params{kHighThroughputMinInterval, kHighThroughputMaxInterval, 0, 600};
+        logConnParamRequest("connect", connHandle, connParamScheduler.request(connHandle, params));
     }
 
     void onDisconnect(BLEServer *pServer, struct ble_gap_conn_desc *desc)
@@ -782,17 +955,31 @@ class NimbleBluetoothServerCallback : public BLEServerCallbacks
 
         resetBleSessionState();
 
-        // Defer the advertising restart to runOnce (see pendingStartAdvertising): calling
-        // startAdvertising() here would crash if this disconnect was a host reset.
-        pendingStartAdvertising = true;
-        if (bluetoothPhoneAPI) {
-            bluetoothPhoneAPI->setIntervalFromNow(0);
-        }
-        concurrency::mainDelay.interrupt(); // wake the main loop to service the restart
+        // Defer the advertising restart to runOnce; a host-reset disconnect cannot safely re-enter GAP here.
+        queueAdvertisingRestart();
     }
 };
 
-void NimbleBluetooth::startAdvertising()
+static int advertisingGapEvent(ble_gap_event *event, void *)
+{
+    if (bleDraining)
+        return 0;
+
+    if (event->type == BLE_GAP_EVENT_CONNECT && event->connect.status != 0) {
+        // A failed connect stops advertising with no disconnect callback afterward; EAGAIN can
+        // also hold the connection slot briefly, so recovery waits for that handle to go away.
+        if (event->connect.status == BLE_HS_EAGAIN)
+            failedAdvertisingConnHandle = event->connect.conn_handle;
+        queueAdvertisingRestart();
+    } else if (event->type == BLE_GAP_EVENT_ADV_COMPLETE && event->adv_complete.reason != 0) {
+        // Advertising is configured to run indefinitely; a nonzero completion reason needs recovery on the main task.
+        LOG_WARN("BLE advertising ended rc=%d; retry", event->adv_complete.reason);
+        queueAdvertisingRestart();
+    }
+    return 0;
+}
+
+bool NimbleBluetooth::startAdvertising()
 {
     BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
     pAdvertising->stop();
@@ -811,9 +998,11 @@ void NimbleBluetooth::startAdvertising()
 
     if (!pAdvertising->start(0)) {
         LOG_ERROR("BLE advertising start failed");
-    } else {
-        LOG_DEBUG("BLE Advertising started");
+        return false;
     }
+
+    LOG_DEBUG("BLE Advertising started");
+    return true;
 }
 
 void NimbleBluetooth::shutdown()
@@ -921,6 +1110,10 @@ void NimbleBluetooth::setup()
 #endif
 
     BLEDevice::init(getDeviceName());
+
+    // Re-register on every BLE enable so the GAP handler survives host teardown between cycles;
+    // NimBLE tolerates an existing registration with EALREADY.
+    BLEDevice::setCustomGapHandler(bleConnParamGapEvent);
     BLEDevice::setPower(ESP_PWR_LVL_P9);
 
     int mtuResult = BLEDevice::setMTU(kPreferredBleMtu);
@@ -929,6 +1122,11 @@ void NimbleBluetooth::setup()
     } else {
         LOG_WARN("Can't request MTU %u, rc=%d", kPreferredBleMtu, mtuResult);
     }
+
+    static ble_gap_event_listener advertisingListener;
+    int listenerResult = ble_gap_event_listener_register(&advertisingListener, advertisingGapEvent, nullptr);
+    if (listenerResult != 0 && listenerResult != BLE_HS_EALREADY)
+        LOG_ERROR("BLE advertising listener registration failed, rc=%d", listenerResult);
 
     // BLESecurity only forwards to static NimBLEDevice setters; a stack instance suffices.
     BLESecurity security;
@@ -972,7 +1170,9 @@ void NimbleBluetooth::setup()
     static NimbleBluetoothServerCallback serverCallbacks(this); // safe: NimbleBluetooth is a never-deleted singleton
     bleServer->setCallbacks(&serverCallbacks);
     setupService();
-    startAdvertising();
+    // A failed first start has no later disconnect or advertising event to retry from.
+    if (!startAdvertising())
+        queueAdvertisingRestart();
 }
 
 void NimbleBluetooth::setupService()

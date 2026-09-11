@@ -244,6 +244,21 @@ bool AdminModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshta
     }
     // Before the switch, so every case below sees consistent transaction state.
     expireStaleEditTransaction();
+    const bool changesState = !messageIsRequest(r) && !messageIsResponse(r);
+    if (hasOpenEditTransaction && changesState && editTransactionOwner != mp.from) {
+        LOG_WARN("Admin edit transaction owned by 0x%08x; rejecting writer 0x%08x", editTransactionOwner, mp.from);
+        myReply = allocErrorResponse(meshtastic_Routing_Error_BAD_REQUEST, &mp);
+        return handled;
+    }
+    if (r->which_payload_variant == meshtastic_AdminMessage_begin_edit_settings_tag) {
+        if (!hasOpenEditTransaction)
+            editTransactionOwner = mp.from;
+        if (mp.from == 0 && editTransactionOriginalDest == 0)
+            editTransactionOriginalDest = mp.to;
+    } else if (r->which_payload_variant == meshtastic_AdminMessage_commit_edit_settings_tag) {
+        editTransactionOriginalDest = 0;
+        editTransactionOwner = 0;
+    }
 
     switch (r->which_payload_variant) {
 
@@ -452,8 +467,14 @@ bool AdminModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshta
     }
     case meshtastic_AdminMessage_factory_reset_device_tag: {
         LOG_INFO("Initiate full factory reset");
-        nodeDB->factoryReset(true);
+#if defined(ARCH_ESP32)
+        // Full reset also erases NVS, so stop NimBLE before destructive work.
         disableBluetooth();
+#endif
+        nodeDB->factoryReset(true);
+#if !defined(ARCH_ESP32)
+        disableBluetooth();
+#endif
         reboot(DEFAULT_REBOOT_SECONDS);
         break;
     }
@@ -482,11 +503,13 @@ bool AdminModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshta
         break;
     }
     case meshtastic_AdminMessage_commit_edit_settings_tag: {
-        disableBluetooth();
         LOG_INFO("Commit settings edit transaction");
+        const bool shouldReboot = deferredEditReboot;
         hasOpenEditTransaction = false;
         deferredEditSegments = 0;
-        saveChanges(SEGMENT_CONFIG | SEGMENT_MODULECONFIG | SEGMENT_DEVICESTATE | SEGMENT_CHANNELS | SEGMENT_NODEDATABASE);
+        deferredEditReboot = false;
+        saveChanges(SEGMENT_CONFIG | SEGMENT_MODULECONFIG | SEGMENT_DEVICESTATE | SEGMENT_CHANNELS | SEGMENT_NODEDATABASE,
+                    shouldReboot);
         flushChannelWarnings(); // one coalesced message for everything edited in this transaction
         break;
     }
@@ -662,11 +685,12 @@ bool AdminModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshta
     }
     case meshtastic_AdminMessage_restore_preferences_tag: {
         LOG_INFO("Client requests preferences restore");
-        if (nodeDB->restorePreferences(r->backup_preferences,
+        if (nodeDB->restorePreferences(r->restore_preferences,
                                        SEGMENT_DEVICESTATE | SEGMENT_CONFIG | SEGMENT_MODULECONFIG | SEGMENT_CHANNELS)) {
             myReply = allocErrorResponse(meshtastic_Routing_Error_NONE, &mp);
             LOG_DEBUG("Rebooting after preferences restore");
-            disableBluetooth();
+            // reboot() accepts seconds. Keep the active transport alive so want_response clients
+            // can receive the success reply before the scheduled reboot owns final teardown.
             reboot(DEFAULT_REBOOT_SECONDS);
         } else {
             myReply = allocErrorResponse(meshtastic_Routing_Error_BAD_REQUEST, &mp);
@@ -1275,8 +1299,7 @@ bool AdminModule::handleSetModuleConfig(const meshtastic_ModuleConfig &c)
         if (!MQTT::isValidConfig(c.payload_variant.mqtt)) {
             return false;
         }
-        // Disable Bluetooth to prevent interference during MQTT configuration, except inside an edit
-        // transaction: saveChanges() defers the reboot there, so nothing would bring BLE back.
+        // A transaction still needs this transport for the remaining writes and commit.
         if (!hasOpenEditTransaction)
             disableBluetooth();
         moduleConfig.has_mqtt = true;
@@ -1296,9 +1319,8 @@ bool AdminModule::handleSetModuleConfig(const meshtastic_ModuleConfig &c)
             LOG_ERROR("Invalid serial config");
             return false;
         }
-        // Same transaction caveat as MQTT above: a deferred reboot would leave BLE down with no restore.
         if (!hasOpenEditTransaction)
-            disableBluetooth(); // Disable Bluetooth to prevent interference during Serial configuration
+            disableBluetooth(); // Prevent interference during standalone Serial configuration.
         moduleConfig.has_serial = true;
         moduleConfig.serial = c.payload_variant.serial;
         break;
@@ -1721,20 +1743,26 @@ void AdminModule::handleGetNodeRemoteHardwarePins(const meshtastic_MeshPacket &r
 {
     meshtastic_AdminMessage r = meshtastic_AdminMessage_init_default;
     r.which_payload_variant = meshtastic_AdminMessage_get_node_remote_hardware_pins_response_tag;
-    for (uint8_t i = 0; i < devicestate.node_remote_hardware_pins_count; i++) {
+    auto &response = r.get_node_remote_hardware_pins_response;
+    constexpr size_t maxResponsePins = sizeof(response.node_remote_hardware_pins) / sizeof(response.node_remote_hardware_pins[0]);
+
+    for (uint8_t i = 0;
+         i < devicestate.node_remote_hardware_pins_count && response.node_remote_hardware_pins_count < maxResponsePins; i++) {
         if (devicestate.node_remote_hardware_pins[i].node_num == 0 || !devicestate.node_remote_hardware_pins[i].has_pin) {
             continue;
         }
-        r.get_node_remote_hardware_pins_response.node_remote_hardware_pins[i] = devicestate.node_remote_hardware_pins[i];
+        response.node_remote_hardware_pins[response.node_remote_hardware_pins_count++] = devicestate.node_remote_hardware_pins[i];
     }
-    for (uint8_t i = 0; i < moduleConfig.remote_hardware.available_pins_count; i++) {
+    for (uint8_t i = 0;
+         i < moduleConfig.remote_hardware.available_pins_count && response.node_remote_hardware_pins_count < maxResponsePins;
+         i++) {
         if (!moduleConfig.remote_hardware.available_pins[i].gpio_pin) {
             continue;
         }
         meshtastic_NodeRemoteHardwarePin nodePin = meshtastic_NodeRemoteHardwarePin_init_default;
         nodePin.node_num = nodeDB->getNodeNum();
         nodePin.pin = moduleConfig.remote_hardware.available_pins[i];
-        r.get_node_remote_hardware_pins_response.node_remote_hardware_pins[i + 12] = nodePin;
+        response.node_remote_hardware_pins[response.node_remote_hardware_pins_count++] = nodePin;
     }
     setPassKey(&r);
     myReply = allocDataProtobuf(r);
@@ -1886,6 +1914,13 @@ void AdminModule::reboot(int32_t seconds)
     rebootAtMsec = (seconds < 0) ? 0 : (millis() + seconds * 1000);
 }
 
+NodeNum AdminModule::getEditTransactionOriginalDest() const
+{
+    return hasOpenEditTransaction && Throttle::isWithinTimespanMs(editTransactionActivityMs, EDIT_TRANSACTION_IDLE_MS)
+               ? editTransactionOriginalDest
+               : 0;
+}
+
 // Without this, a commit that never arrives leaves the transaction open forever and every later
 // config write from any client is applied, acknowledged, and then never saved.
 void AdminModule::expireStaleEditTransaction()
@@ -1893,13 +1928,18 @@ void AdminModule::expireStaleEditTransaction()
     if (!hasOpenEditTransaction || Throttle::isWithinTimespanMs(editTransactionActivityMs, EDIT_TRANSACTION_IDLE_MS))
         return;
 
+    editTransactionOriginalDest = 0;
+    editTransactionOwner = 0;
     LOG_WARN("Edit transaction abandoned for %us; committing what it applied", EDIT_TRANSACTION_IDLE_MS / 1000);
     hasOpenEditTransaction = false;
-    int segments = deferredEditSegments;
+    const int segments = deferredEditSegments;
+    const bool shouldReboot = deferredEditReboot;
     deferredEditSegments = 0;
-    // No reboot: the settings are already live in RAM and the client that would expect one is gone.
+    deferredEditReboot = false;
     if (segments)
         saveChanges(segments, false);
+    if (shouldReboot)
+        reboot(DEFAULT_REBOOT_SECONDS);
     flushChannelWarnings();
 }
 
@@ -1915,6 +1955,7 @@ void AdminModule::saveChanges(int saveWhat, bool shouldReboot)
         LOG_INFO("Delay disk save until open transaction commits");
         editTransactionActivityMs = millis(); // still in use, so not the abandoned kind we time out
         deferredEditSegments |= saveWhat;
+        deferredEditReboot |= shouldReboot;
     }
     if (shouldReboot && !hasOpenEditTransaction) {
         reboot(DEFAULT_REBOOT_SECONDS);
@@ -2503,8 +2544,25 @@ void AdminModule::warnOnLoraPresetChange(const meshtastic_Config_LoRaConfig &old
     }
 } // warnOnLoraPresetChange
 
+#ifdef PIO_UNIT_TESTING
+static uint32_t disableBluetoothCallCountForTest = 0;
+
+uint32_t getDisableBluetoothCallCountForTest()
+{
+    return disableBluetoothCallCountForTest;
+}
+
+void resetDisableBluetoothCallCountForTest()
+{
+    disableBluetoothCallCountForTest = 0;
+}
+#endif
+
 void disableBluetooth()
 {
+#ifdef PIO_UNIT_TESTING
+    disableBluetoothCallCountForTest++;
+#endif
 #if HAS_BLUETOOTH
 #ifdef ARCH_ESP32
     if (nimbleBluetooth)
