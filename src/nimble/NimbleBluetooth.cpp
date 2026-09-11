@@ -364,15 +364,19 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
     virtual int32_t runOnce() override
     {
 #if defined(ARCH_ESP32) && defined(CONFIG_IDF_TARGET_ESP32)
-        if (!bleDraining && nimbleBluetooth && nimbleBluetooth->isActive() && bleServer && bleServer->getConnectedCount() == 0 &&
+        if (!bleDraining && !pendingStartAdvertising.load() && failedAdvertisingConnHandle.load() == BLE_HS_CONN_HANDLE_NONE &&
+            nimbleBluetooth && nimbleBluetooth->isActive() && bleServer && bleServer->getConnectedCount() == 0 &&
             !Throttle::isWithinTimespanMs(lastAdvertisingHealthCheckMs, kAdvertisingHealthCheckMs)) {
             lastAdvertisingHealthCheckMs = millis();
             const bool hostSynced = ble_hs_synced();
             const bool advertising = hostSynced && BLEDevice::getAdvertising()->isAdvertising();
             const auto controllerStatus = esp_bt_controller_get_status();
 
-            if (hostSynced && controllerStatus == ESP_BT_CONTROLLER_STATUS_ENABLED && !advertising) {
-                LOG_WARN("BLE idle health found advertising inactive; restarting");
+            if (hostSynced && controllerStatus == ESP_BT_CONTROLLER_STATUS_ENABLED) {
+                if (advertising)
+                    LOG_INFO("BLE idle advertising lease refresh");
+                else
+                    LOG_WARN("BLE idle health found advertising inactive; restarting");
                 if (!nimbleBluetooth->startAdvertising()) {
                     queueAdvertisingRestart();
                 }
@@ -1001,6 +1005,9 @@ bool NimbleBluetooth::startAdvertising()
         return false;
     }
 
+#if defined(ARCH_ESP32) && defined(CONFIG_IDF_TARGET_ESP32)
+    lastAdvertisingHealthCheckMs = millis();
+#endif
     LOG_DEBUG("BLE Advertising started");
     return true;
 }
