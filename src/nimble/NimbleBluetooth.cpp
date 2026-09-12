@@ -30,6 +30,7 @@
 #include <nvs_flash.h>
 #if defined(CONFIG_IDF_TARGET_ESP32)
 #include <esp_bt.h>
+extern "C" volatile uint32_t lld_evt_env[]; // lld_evt_env[3] is ble_ll_get_adv_txed_cnt()'s counter.
 #endif
 #endif
 
@@ -370,15 +371,16 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
             const bool hostSynced = ble_hs_synced();
             const bool advertising = hostSynced && BLEDevice::getAdvertising()->isAdvertising();
             const auto controllerStatus = esp_bt_controller_get_status();
+            const uint32_t advertisingTxCount = lld_evt_env[3];
 
             if (hostSynced && controllerStatus == ESP_BT_CONTROLLER_STATUS_ENABLED && !advertising) {
-                LOG_WARN("BLE idle health found advertising inactive; restarting");
+                LOG_WARN("BLE idle health found advertising inactive; restarting adv_tx=%u", (unsigned)advertisingTxCount);
                 if (!nimbleBluetooth->startAdvertising()) {
                     queueAdvertisingRestart();
                 }
             } else {
-                LOG_INFO("BLE idle health synced=%d advertising=%d controller=%d", hostSynced ? 1 : 0, advertising ? 1 : 0,
-                         (int)controllerStatus);
+                LOG_INFO("BLE idle health synced=%d advertising=%d controller=%d adv_tx=%u", hostSynced ? 1 : 0,
+                         advertising ? 1 : 0, (int)controllerStatus, (unsigned)advertisingTxCount);
             }
         }
 #endif
