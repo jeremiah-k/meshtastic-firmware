@@ -21,13 +21,18 @@ namespace
 constexpr uintptr_t EA_PROG_TIMER_ASSERT_RETURN_PC = 0x400150b6U;
 constexpr uintptr_t EA_FINE_TARGET_INT_MASK_REG = 0x3ff7100cU;
 constexpr uintptr_t EA_FINE_TARGET_INT_STATUS_REG = 0x3ff71010U;
+constexpr uintptr_t EA_FINE_TARGET_INT_ACK_REG = 0x3ff71018U;
 constexpr uintptr_t EA_FINE_TARGET_REG = 0x3ff710b8U;
+constexpr uint32_t EA_FINE_TARGET_INT_BIT = 1U << 9;
+constexpr uint32_t EA_OBSERVED_INT_MASK = 0x0003c802U;
+constexpr uint32_t EA_OBSERVED_CLOCK_LAG = 4U;
 constexpr uint32_t EA_SLOT_CLOCK_MASK = 0x07ffffffU;
 constexpr uintptr_t ESP32_DRAM_START = 0x3ffae000U;
 constexpr uintptr_t ESP32_DRAM_LAST_RECORD = 0x3fffffe0U;
 constexpr uintptr_t SCO_AUDIO_ASSERT_RETURN_PC = 0x40037edcU;
 constexpr uint8_t DISABLED_SCO_SLOT = UINT8_MAX;
 bool spuriousScoIsrReported;
+bool eaProgTimerRecoveryUsed;
 
 bool isSpuriousScoAudioIsrAssert(uintptr_t callerPc, int line)
 {
@@ -48,6 +53,11 @@ bool isReadableEaRecord(uintptr_t address)
 uint32_t readReg32(uintptr_t address)
 {
     return *reinterpret_cast<volatile const uint32_t *>(address);
+}
+
+void writeReg32(uintptr_t address, uint32_t value)
+{
+    *reinterpret_cast<volatile uint32_t *>(address) = value;
 }
 } // namespace
 #endif
@@ -99,17 +109,43 @@ extern "C" void __wrap_r_assert_err(const char *condition, const char *file, int
                        static_cast<unsigned>(interruptStatus), static_cast<unsigned>(programmedTarget));
         esp_rom_printf("BT_CTRL_EA_CLOCK slot=%08x half=%08x requested=%08x\n", static_cast<unsigned>(currentSlot),
                        static_cast<unsigned>(currentHalfSlot), static_cast<unsigned>(requestedTarget));
+        const uint16_t primaryAsapSettings =
+            isReadableEaRecord(primary) ? *reinterpret_cast<volatile const uint16_t *>(primary + 16) : UINT16_MAX;
+        const uint8_t primaryPriority = isReadableEaRecord(primary) ? primaryBytes[22] : UINT8_MAX;
+
         esp_rom_printf(
             "BT_CTRL_EA_RECORD p8=%08x p16=%04x p22=%u p25=%u s22=%u s23=%u s24=%u a4=%08x\n",
-            static_cast<unsigned>(primaryTimestamp),
-            isReadableEaRecord(primary) ? static_cast<unsigned>(*reinterpret_cast<volatile const uint16_t *>(primary + 16))
-                                        : static_cast<unsigned>(UINT16_MAX),
-            isReadableEaRecord(primary) ? static_cast<unsigned>(primaryBytes[22]) : static_cast<unsigned>(UINT8_MAX),
-            static_cast<unsigned>(primaryStartLatency),
+            static_cast<unsigned>(primaryTimestamp), static_cast<unsigned>(primaryAsapSettings),
+            static_cast<unsigned>(primaryPriority), static_cast<unsigned>(primaryStartLatency),
             isReadableEaRecord(secondary) ? static_cast<unsigned>(secondaryBytes[22]) : static_cast<unsigned>(UINT8_MAX),
             isReadableEaRecord(secondary) ? static_cast<unsigned>(secondaryBytes[23]) : static_cast<unsigned>(UINT8_MAX),
             isReadableEaRecord(secondary) ? static_cast<unsigned>(secondaryBytes[24]) : static_cast<unsigned>(UINT8_MAX),
             isReadableEaRecord(active) ? static_cast<unsigned>(activeWords[1]) : static_cast<unsigned>(missing));
+
+        // Two independent boards reproduced this exact state: the requested target was already programmed, no fine-target
+        // interrupt was pending, the fine-target enable bit was clear, and the EA rounded clock read four ticks behind the
+        // target. Later RivieraWaves EA implementations recover the equivalent missed-deadline condition by advancing the
+        // fine target one tick and arming its interrupt instead of asserting. Keep this treatment intentionally narrower than
+        // that general fix: one recovery per boot, only for the exact state observed on both original ESP32 T-Beams.
+        const bool exactObservedEaDeadlineRace =
+            !eaProgTimerRecoveryUsed && interruptMask == EA_OBSERVED_INT_MASK && interruptStatus == 0U &&
+            programmedTarget == requestedTarget && currentSlot == currentHalfSlot &&
+            ((requestedTarget - currentSlot) & EA_SLOT_CLOCK_MASK) == EA_OBSERVED_CLOCK_LAG && secondary == 0U && active == 0U &&
+            primaryAsapSettings == 0U && primaryPriority == 5U && primaryStartLatency == 2U;
+
+        if (exactObservedEaDeadlineRace) {
+            const uint32_t retryTarget = (programmedTarget + 1U) & EA_SLOT_CLOCK_MASK;
+            const uint32_t targetRegister = (readReg32(EA_FINE_TARGET_REG) & ~EA_SLOT_CLOCK_MASK) | retryTarget;
+
+            eaProgTimerRecoveryUsed = true;
+            writeReg32(EA_FINE_TARGET_REG, targetRegister);
+            writeReg32(EA_FINE_TARGET_INT_ACK_REG, EA_FINE_TARGET_INT_BIT);
+            writeReg32(EA_FINE_TARGET_INT_MASK_REG, interruptMask | EA_FINE_TARGET_INT_BIT);
+            esp_rom_printf("BT_CTRL_EA_RECOVERED target=%08x retry=%08x mask=%08x\n",
+                           static_cast<unsigned>(programmedTarget), static_cast<unsigned>(retryTarget),
+                           static_cast<unsigned>(interruptMask | EA_FINE_TARGET_INT_BIT));
+            return;
+        }
     }
     if (line == 7098) {
         esp_rom_printf("BT_CTRL_SCO_CONTEXT env=%08x,%08x,%08x sw_to_hw14=%u\n",
