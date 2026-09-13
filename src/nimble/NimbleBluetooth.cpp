@@ -32,6 +32,13 @@
 #endif
 #endif
 
+#if defined(ARCH_ESP32) && defined(CONFIG_IDF_TARGET_ESP32)
+extern "C" {
+extern uint32_t lld_evt_env[];
+extern uint32_t llm_elt[];
+}
+#endif
+
 namespace
 {
 constexpr uint16_t kPreferredBleMtu = 517;
@@ -258,6 +265,22 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
             } else {
                 LOG_INFO("BLE idle health synced=%d advertising=%d controller=%d", hostSynced ? 1 : 0, advertising ? 1 : 0,
                          (int)controllerStatus);
+
+                // Original ESP32-only, read-only scheduler snapshot. The ROM controller's lld_evt_env
+                // starts with three co_list values (programmed, waiting, deferred); llm_elt is a
+                // 12-byte controller object in the exact T-Beam ELF. These raw values intentionally
+                // avoid inferring host advertising health from GAP state alone. No controller state
+                // is changed here.
+                const volatile uint32_t *const evt = lld_evt_env;
+                const volatile uint32_t *const llm = llm_elt;
+                const uint32_t intMask = *reinterpret_cast<volatile const uint32_t *>(0x3ff7100c);
+                const uint32_t intStatus = *reinterpret_cast<volatile const uint32_t *>(0x3ff71010);
+                const uint32_t fineTarget = *reinterpret_cast<volatile const uint32_t *>(0x3ff710b8);
+                LOG_INFO("BLE ctrl sched prog=%08x/%08x wait=%08x/%08x defer=%08x/%08x llm=%08x/%08x/%08x",
+                         (unsigned)evt[0], (unsigned)evt[1], (unsigned)evt[2], (unsigned)evt[3], (unsigned)evt[4],
+                         (unsigned)evt[5], (unsigned)llm[0], (unsigned)llm[1], (unsigned)llm[2]);
+                LOG_INFO("BLE ctrl timer mask=%08x status=%08x target=%08x", (unsigned)intMask, (unsigned)intStatus,
+                         (unsigned)fineTarget);
             }
         }
 #endif
