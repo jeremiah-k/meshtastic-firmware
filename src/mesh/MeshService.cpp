@@ -295,7 +295,7 @@ NodeNum MeshService::canonicalizeLocalAdminDest(NodeNum origDest, NodeNum curren
  * Called by PhoneAPI.handleToRadio.  Note: p is a scratch buffer, this function is allowed to write to it but it can not keep a
  * reference
  */
-void MeshService::handleToRadio(meshtastic_MeshPacket &p)
+void MeshService::handleToRadio(meshtastic_MeshPacket &p, uint32_t localAdminSessionId)
 {
 #if defined(ARCH_PORTDUINO)
     if (SimRadio::instance && p.decoded.portnum == meshtastic_PortNum_SIMULATOR_APP) {
@@ -332,6 +332,14 @@ void MeshService::handleToRadio(meshtastic_MeshPacket &p)
                       graphics::MessageRenderer::handleNewMessage(nullptr, *sm, p); // notify UI
               })
 #if !MESHTASTIC_EXCLUDE_ADMIN
+    const bool scopedLocalAdmin = adminModule && localAdminSessionId != 0 &&
+                                  p.which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
+                                  p.decoded.portnum == meshtastic_PortNum_ADMIN_APP;
+    if (scopedLocalAdmin) {
+        localAdminDispatchLock.lock();
+        adminModule->setLocalAdminSessionForDispatch(localAdminSessionId);
+    }
+
     // Note admin requests on their way out: AdminModule only accepts a response from a remote we
     // actually asked. Runs before encryption, while the payload is still readable.
     if (adminModule && p.which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
@@ -348,6 +356,12 @@ void MeshService::handleToRadio(meshtastic_MeshPacket &p)
     DEBUG_HEAP_AFTER("MeshService::handleToRadio", a);
     if (a)
         sendToMesh(a, RX_SRC_USER);
+#if !MESHTASTIC_EXCLUDE_ADMIN
+    if (scopedLocalAdmin) {
+        adminModule->setLocalAdminSessionForDispatch(0);
+        localAdminDispatchLock.unlock();
+    }
+#endif
 
     bool loopback = false; // if true send any packet the phone sends back itself (for testing)
     if (loopback) {

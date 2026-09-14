@@ -10,8 +10,10 @@
 #include <unity.h>
 
 #include "mesh/NodeDB.h"
+#include "mesh/PhoneAPI.h"
 #include "modules/RoutingModule.h"
 #include "support/AdminModuleTestShim.h"
+#include "SyntheticFixtures.h"
 #include "support/MockMeshService.h"
 
 namespace
@@ -33,6 +35,15 @@ class CaptureRadio : public RadioInterface
 // A decoded admin DM whose destination has no key in the fresh NodeDB - the post-commit, remote
 // and non-admin-port cases - is refused by Router::send's PKI path with PKI_SEND_FAIL_PUBLIC_KEY
 // and NAKs through this seam instead of crashing on a null global.
+class LocalSessionPhoneAPITestShim : public PhoneAPI
+{
+  public:
+    uint32_t localSessionId() { return getLocalAdminSessionId(); }
+
+  protected:
+    bool checkIsConnected() override { return true; }
+};
+
 class MockRoutingModule : public RoutingModule
 {
   public:
@@ -59,14 +70,6 @@ class MockRouter : public Router
     void enqueueReceivedMessage(meshtastic_MeshPacket *p) override { packetPool.release(p); }
 };
 } // namespace
-
-// Two distinguishable node numbers used to simulate the pre/post rekey state.
-static constexpr NodeNum ORIGINAL_SELF = 0xA1A2A3A4;
-static constexpr NodeNum POST_REKEY_SELF = 0xB1B2B3B4;
-static constexpr NodeNum STRANGER_REMOTE = 0xD1D2D3D4;
-static const uint8_t REMOTE_KEY[32] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb,
-                                       0xcc, 0xdd, 0xee, 0xff, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-                                       0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x20};
 
 static MockMeshService *mockService = nullptr;
 static AdminModuleTestShim *admin = nullptr;
@@ -98,8 +101,7 @@ void setUp(void)
     service = mockService;
     admin = new AdminModuleTestShim();
     adminModule = admin; // wire the global so MeshService::handleToRadio's guard fires
-    // deferSaves() so accepted setters stay in RAM, no disk/reboot.
-    admin->deferSaves();
+    admin->setLocalSession(1);
     testNodeDB = new NodeDB();
     nodeDB = testNodeDB;
     mockRouter = new MockRouter();
@@ -141,6 +143,18 @@ static void sendBegin()
     meshtastic_MeshPacket mp = meshtastic_MeshPacket_init_zero;
     mp.from = 0;
     mp.to = nodeDB->getNodeNum();
+    mp.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
+    admin->handleReceivedProtobuf(mp, &m);
+}
+
+static void sendBeginTo(NodeNum dest)
+{
+    meshtastic_AdminMessage m = meshtastic_AdminMessage_init_zero;
+    m.which_payload_variant = meshtastic_AdminMessage_begin_edit_settings_tag;
+    m.begin_edit_settings = true;
+    meshtastic_MeshPacket mp = meshtastic_MeshPacket_init_zero;
+    mp.from = 0;
+    mp.to = dest;
     mp.which_payload_variant = meshtastic_MeshPacket_decoded_tag;
     admin->handleReceivedProtobuf(mp, &m);
 }
@@ -304,10 +318,10 @@ static void test_alias_isRetainedAcrossMultipleRekeys(void)
     myNodeInfo.my_node_num = POST_REKEY_SELF;
     TEST_ASSERT_EQUAL_UINT32(ORIGINAL_SELF, admin->getEditTransactionOriginalDest());
 
-    myNodeInfo.my_node_num = 0xE1E2E3E4;
+    myNodeInfo.my_node_num = SECOND_REKEY_SELF;
     TEST_ASSERT_EQUAL_UINT32(ORIGINAL_SELF, admin->getEditTransactionOriginalDest());
 
-    myNodeInfo.my_node_num = 0xF1F2F3F4;
+    myNodeInfo.my_node_num = THIRD_REKEY_SELF;
     TEST_ASSERT_EQUAL_UINT32(ORIGINAL_SELF, admin->getEditTransactionOriginalDest());
 }
 
@@ -353,6 +367,48 @@ static void test_alias_remoteBegin_doesNotCapture(void)
     TEST_ASSERT_EQUAL_UINT32(ORIGINAL_SELF, admin->getEditTransactionOriginalDest());
 }
 
+static void test_alias_broadcastBegin_doesNotCapture()
+{
+    sendBeginTo(NODENUM_BROADCAST);
+    TEST_ASSERT_TRUE(admin->editTransactionOpen());
+    TEST_ASSERT_EQUAL_UINT32(0, admin->getEditTransactionOriginalDest());
+    sendCommit();
+}
+
+static void test_phoneApi_localSessions_areDistinctAndRenewOnClose()
+{
+    LocalSessionPhoneAPITestShim first;
+    LocalSessionPhoneAPITestShim second;
+    const uint32_t firstId = first.localSessionId();
+    const uint32_t secondId = second.localSessionId();
+    TEST_ASSERT_NOT_EQUAL(0, firstId);
+    TEST_ASSERT_NOT_EQUAL(0, secondId);
+    TEST_ASSERT_NOT_EQUAL(firstId, secondId);
+
+    first.close();
+    const uint32_t renewedId = first.localSessionId();
+    TEST_ASSERT_NOT_EQUAL(0, renewedId);
+    TEST_ASSERT_NOT_EQUAL(firstId, renewedId);
+}
+
+static void test_alias_secondLocalSession_cannotCommitFirstSession()
+{
+    admin->setLocalSession(1);
+    sendBegin();
+    admin->setLocalSession(2);
+    sendCommit();
+
+    meshtastic_Routing_Error error = meshtastic_Routing_Error_NONE;
+    TEST_ASSERT_TRUE(decodeRoutingError(admin->reply(), error));
+    TEST_ASSERT_EQUAL(meshtastic_Routing_Error_BAD_REQUEST, error);
+    TEST_ASSERT_TRUE(admin->editTransactionOpen());
+    admin->drainReply();
+
+    admin->setLocalSession(1);
+    sendCommit();
+    TEST_ASSERT_FALSE(admin->editTransactionOpen());
+}
+
 // -----------------------------------------------------------------------
 // MeshService::handleToRadio() integration - drives the production rewrite seam.
 // -----------------------------------------------------------------------
@@ -390,11 +446,11 @@ static void test_handleToRadio_multipleRekeys_eachRewrittenToCurrentSelf(void)
         TEST_ASSERT_EQUAL_UINT32(POST_REKEY_SELF, p.to);
     }
 
-    myNodeInfo.my_node_num = 0xE1E2E3E4;
+    myNodeInfo.my_node_num = SECOND_REKEY_SELF;
     {
         meshtastic_MeshPacket p = makeAdminPacket(ORIGINAL_SELF);
         service->handleToRadio(p);
-        TEST_ASSERT_EQUAL_UINT32(0xE1E2E3E4, p.to);
+        TEST_ASSERT_EQUAL_UINT32(SECOND_REKEY_SELF, p.to);
     }
 }
 
@@ -492,6 +548,9 @@ void setup()
     RUN_TEST(test_alias_repeatedBeginAfterRekey_preservesOriginalDest);
     RUN_TEST(test_alias_remoteCommit_doesNotTerminateLocalTransaction);
     RUN_TEST(test_alias_remoteBegin_doesNotCapture);
+    RUN_TEST(test_alias_broadcastBegin_doesNotCapture);
+    RUN_TEST(test_phoneApi_localSessions_areDistinctAndRenewOnClose);
+    RUN_TEST(test_alias_secondLocalSession_cannotCommitFirstSession);
 
     // MeshService::handleToRadio integration
     RUN_TEST(test_handleToRadio_unchangedIdentity_noRewrite);

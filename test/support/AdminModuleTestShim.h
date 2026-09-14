@@ -30,6 +30,7 @@ class AdminModuleTestShim : public AdminModule
     int savedSegments() const { return lastSaveWhatForTest; }
 
     bool editTransactionOpen() const { return hasOpenEditTransaction; }
+    void setLocalSession(uint32_t id) { setLocalAdminSessionForDispatch(id); }
     // Backdate past the idle window so a test sees an abandoned transaction without waiting it out.
     void ageEditTransaction() { editTransactionActivityMs = millis() - EDIT_TRANSACTION_IDLE_MS - 1; }
 
