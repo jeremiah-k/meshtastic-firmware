@@ -27,15 +27,25 @@ inline void advanceTestMillis(uint32_t deltaMs)
     testNowMs.fetch_add(deltaMs, std::memory_order_relaxed);
     useTestClock.store(true, std::memory_order_relaxed);
 }
-// Restore real-clock behaviour (call in test tearDown if a suite mixes real and fake time).
-inline void useRealClock()
+// Test-only absolute 64-bit sample used to exercise the ESP32 accounting path
+// from native tests. Independent of setTestMillis(); arm only one source.
+inline std::atomic<uint64_t> testNowMs64{0};
+inline std::atomic<bool> useTestNative64{false};
+inline void setTestMonotonicMs64(uint64_t ms)
 {
-    useTestClock.store(false, std::memory_order_relaxed);
-    testNowMs.store(0, std::memory_order_relaxed);
+    testNowMs64.store(ms, std::memory_order_relaxed);
+    useTestNative64.store(true, std::memory_order_relaxed);
 }
 // Zero the published wrap carry. Suites that assert absolute uptime values call this in setUp():
 // a previous case that moved the test clock backwards left a counted wrap behind.
 void resetMonotonicForTests();
+// Restore real-clock behaviour without retaining a future injected monotonic snapshot.
+inline void useRealClock()
+{
+    useTestClock.store(false, std::memory_order_relaxed);
+    testNowMs.store(0, std::memory_order_relaxed);
+    resetMonotonicForTests();
+}
 void setMonotonicPublishHookForTests(MonotonicPublishHook hook);
 #endif
 
@@ -81,6 +91,8 @@ static_assert(skipZero(UINT32_MAX) == UINT32_MAX, "skipZero must not wrap the la
 /// plus the unsigned elapsed time since that snapshot, which is exact across the wrap. A reader
 /// that preempts publication uses the previous snapshot. If publication completes during a copy,
 /// the reader retries; it never waits for a publish in progress.
+/// ESP32 uses native 64-bit esp_timer samples; backward samples hold the high-water
+/// mark - the greatest value already returned - instead of a 32-bit wrap.
 ///
 /// Not intended for ISR call sites because lock-free std::atomic operations are not guaranteed by
 /// every supported toolchain. ISRs use getMillis(); the publication protocol itself never waits.
@@ -94,7 +106,8 @@ uint32_t getUptimeSecs();
 /// else. Two concurrent callers could count one wrap twice, jumping every uptime and wall-clock
 /// reading ~49.7 days forward for the rest of the boot.
 ///
-/// Must run at least once per ~49.7-day wrap window; the main loop calls it every iteration.
+/// On 32-bit-sample platforms this must run at least once per ~49.7-day wrap window; the main
+/// loop calls it every iteration (ESP32's native 64-bit sample cannot wrap; the cadence is kept).
 void serviceMonotonic();
 
 } // namespace Time
