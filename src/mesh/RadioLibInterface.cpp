@@ -629,7 +629,8 @@ void RadioLibInterface::handleReceiveInterrupt()
 
 #ifndef DISABLE_WELCOME_UNSET
     if (config.lora.region == meshtastic_Config_LoRaConfig_RegionCode_UNSET) {
-        LOG_WARN("lora rx disabled: Region unset");
+        // UNSET intentionally disables mesh receive; stay quiet while still accounting observed airtime.
+        LOG_DEBUG("lora rx disabled: Region unset");
         airTime->logAirtime(RX_ALL_LOG, rxMsec);
         return;
     }
@@ -740,6 +741,12 @@ void RadioLibInterface::resetAGC()
 
 void RadioLibInterface::periodicRadioMaintenance()
 {
+#ifndef DISABLE_WELCOME_UNSET
+    // UNSET intentionally disables LoRa, so silence is not a radio-health failure.
+    if (config.lora.region == meshtastic_Config_LoRaConfig_RegionCode_UNSET)
+        return;
+#endif
+
     // Every startReceive() call site is event-driven (RX/TX ISR, the CAD-busy branch, reconfigure), and a
     // radio left with RX off can no longer raise an RX interrupt - on a node with nothing to transmit
     // nothing would ever re-arm it. This periodic tick is that retry; maybeRecoverChipStateLoss() throttles.
@@ -755,6 +762,12 @@ void RadioLibInterface::periodicRadioMaintenance()
 
 bool RadioLibInterface::maybeRecoverChipStateLoss()
 {
+#ifndef DISABLE_WELCOME_UNSET
+    // Under normal policy, UNSET silence must not escalate into the recovery/reboot ladder.
+    if (config.lora.region == meshtastic_Config_LoRaConfig_RegionCode_UNSET)
+        return false;
+#endif
+
     // One attempt per window: the transient resets this recovers from need a single re-init, and a
     // chip that stays dead must not stall the TX/RX paths with a begin() attempt on every call
     if (lastChipRecoveryMs && Throttle::isWithinTimespanMs(lastChipRecoveryMs, 30 * 1000UL)) {
